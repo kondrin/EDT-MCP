@@ -10,8 +10,6 @@ import java.util.Map;
 import java.util.Optional;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.runtime.IProgressMonitor;
-import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.core.resources.IWorkspace;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
@@ -19,6 +17,7 @@ import org.eclipse.debug.core.DebugPlugin;
 import org.eclipse.debug.core.ILaunchConfiguration;
 import org.eclipse.debug.core.ILaunchConfigurationType;
 import org.eclipse.debug.core.ILaunchManager;
+import org.eclipse.debug.core.model.IDebugTarget;
 import org.eclipse.swt.widgets.Display;
 
 import com.ditrix.edt.mcp.server.Activator;
@@ -28,15 +27,12 @@ import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.DebugSessionRegistry;
 import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
+import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 import com.e1c.g5.dt.applications.ApplicationException;
-import com.e1c.g5.dt.applications.ApplicationUpdateState;
-import com.e1c.g5.dt.applications.ApplicationUpdateType;
-import com.e1c.g5.dt.applications.ExecutionContext;
 import com.e1c.g5.dt.applications.IApplication;
 import com.e1c.g5.dt.applications.IApplicationManager;
 
-import org.eclipse.swt.widgets.Shell;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
@@ -70,7 +66,11 @@ public class DebugLaunchTool implements IMcpTool
             + "Pass launchConfigurationName to run any existing EDT debug configuration by name " //$NON-NLS-1$
             + "(runtime client OR 'Attach to 1C:Enterprise Debug Server' — required for debugging " //$NON-NLS-1$
             + "server-side code: HTTP services, background jobs, scheduled jobs). " //$NON-NLS-1$
-            + "Otherwise pass projectName + applicationId to launch the matching runtime-client config."; //$NON-NLS-1$
+            + "Otherwise pass projectName + applicationId to launch the matching runtime-client config. " //$NON-NLS-1$
+            + "If a previous launch of the same configuration is still alive, the tool short-circuits " //$NON-NLS-1$
+            + "with `alreadyRunning: true` and does NOT spawn a fresh client — to force a clean restart " //$NON-NLS-1$
+            + "(e.g. after code changes that require a new session), call `terminate_launch` first, " //$NON-NLS-1$
+            + "then `debug_launch` again."; //$NON-NLS-1$
     }
 
     @Override
@@ -270,10 +270,43 @@ public class DebugLaunchTool implements IMcpTool
                 }
             }
 
-            // Update database before launch if requested
+            // If this application already has a live debug session, short-circuit
+            // — mirrors the launchConfigurationName path so both call styles behave
+            // the same. To force a fresh launch, terminate_launch first.
+            IDebugTarget activeTarget = DebugSessionRegistry.findActiveTarget(applicationId);
+            if (activeTarget != null)
+            {
+                String activeConfigName = activeTarget.getLaunch() != null
+                    && activeTarget.getLaunch().getLaunchConfiguration() != null
+                        ? activeTarget.getLaunch().getLaunchConfiguration().getName()
+                        : null;
+                Activator.logInfo("debug_launch short-circuit (alreadyRunning): project=" //$NON-NLS-1$
+                    + projectName + ", applicationId=" + applicationId //$NON-NLS-1$
+                    + ", activeConfig=" + activeConfigName); //$NON-NLS-1$
+                ToolResult already = ToolResult.success()
+                    .put("project", projectName) //$NON-NLS-1$
+                    .put("applicationId", applicationId) //$NON-NLS-1$
+                    .put("attach", false) //$NON-NLS-1$
+                    .put("alreadyRunning", true) //$NON-NLS-1$
+                    .put("mode", "debug") //$NON-NLS-1$ //$NON-NLS-2$
+                    .put("message", "Launch configuration is already running — skipped re-launch. " //$NON-NLS-1$ //$NON-NLS-2$
+                        + "Call terminate_launch first to force a fresh session.");
+                if (activeConfigName != null)
+                {
+                    already.put("launchConfiguration", activeConfigName); //$NON-NLS-1$
+                }
+                return already.toJson();
+            }
+
+            // Update database before launch if requested. Routes through the
+            // shared LaunchLifecycleUtils.updateApplicationIfNeeded so debug_launch
+            // analyses "does the IB need updating?" the same way the YAXUnit tools
+            // do: skip on UPDATED, wait on BEING_UPDATED, incremental-update otherwise.
             if (updateBeforeLaunch && appManager != null && application != null)
             {
-                String updateError = updateDatabase(appManager, application);
+                String updateError = LaunchLifecycleUtils
+                    .updateApplicationIfNeeded(project, applicationId, appManager)
+                    .orElse(null);
                 if (updateError != null)
                 {
                     return ToolResult.error(updateError).toJson();
@@ -360,69 +393,10 @@ public class DebugLaunchTool implements IMcpTool
         {
             return null;
         }
-        try
-        {
-            Optional<IApplication> appOpt = appManager.getApplication(project, applicationId);
-            if (!appOpt.isPresent())
-            {
-                return null;
-            }
-            return updateDatabase(appManager, appOpt.get());
-        }
-        catch (ApplicationException e)
-        {
-            Activator.logError("Error resolving application for DB update", e); //$NON-NLS-1$
-            return null;
-        }
-    }
-
-    private String updateDatabase(IApplicationManager appManager, IApplication application)
-    {
-        try
-        {
-            ApplicationUpdateState updateState = appManager.getUpdateState(application);
-            if (updateState == ApplicationUpdateState.UPDATED
-                || updateState == ApplicationUpdateState.BEING_UPDATED)
-            {
-                return null;
-            }
-
-            Activator.logInfo("Updating database before launch: application=" + application.getId()); //$NON-NLS-1$
-
-            ExecutionContext context = new ExecutionContext();
-            Display display = Display.getDefault();
-            if (display != null && !display.isDisposed())
-            {
-                final Shell[] shellHolder = new Shell[1];
-                display.syncExec(() -> {
-                    shellHolder[0] = display.getActiveShell();
-                    if (shellHolder[0] == null)
-                    {
-                        Shell[] shells = display.getShells();
-                        if (shells.length > 0)
-                        {
-                            shellHolder[0] = shells[0];
-                        }
-                    }
-                });
-                if (shellHolder[0] != null)
-                {
-                    context.setProperty(ExecutionContext.ACTIVE_SHELL_NAME, shellHolder[0]);
-                }
-            }
-
-            IProgressMonitor monitor = new NullProgressMonitor();
-            ApplicationUpdateState stateAfter = appManager.update(application,
-                ApplicationUpdateType.INCREMENTAL, context, monitor);
-            Activator.logInfo("Database update completed: stateAfter=" + stateAfter); //$NON-NLS-1$
-            return null;
-        }
-        catch (ApplicationException e)
-        {
-            Activator.logError("Error updating database before launch", e); //$NON-NLS-1$
-            return "Failed to update database before launch: " + e.getMessage() //$NON-NLS-1$
-                + ". You can retry with updateBeforeLaunch=false to skip update."; //$NON-NLS-1$
-        }
+        // Shared update analysis: skip on UPDATED, wait on BEING_UPDATED, otherwise
+        // incremental-update — same path as the YAXUnit auto-chain.
+        return LaunchLifecycleUtils.updateApplicationIfNeeded(project, applicationId, appManager)
+            .orElse(null);
     }
 
     /**
