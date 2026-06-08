@@ -10,8 +10,6 @@ import java.util.Map;
 import java.util.Optional;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.debug.core.DebugPlugin;
@@ -26,6 +24,7 @@ import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 import com.e1c.g5.dt.applications.ApplicationException;
 import com.e1c.g5.dt.applications.ApplicationUpdateState;
@@ -51,14 +50,12 @@ public class UpdateDatabaseTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Update database (infobase) for an application. " //$NON-NLS-1$
-            + "Target the application either by launchConfigurationName (preferred; " //$NON-NLS-1$
-            + "from list_configurations) or by projectName + applicationId (from get_applications). " //$NON-NLS-1$
-            + "Supports full update (complete reload) and incremental update (changes only). " //$NON-NLS-1$
-            + "IMPORTANT: if a 1С client launched from this EDT is currently running against " //$NON-NLS-1$
-            + "the target infobase, the update typically fails because the IB is held in exclusive " //$NON-NLS-1$
-            + "use. Check `list_configurations` for `running: true`; if so, call `terminate_launch` " //$NON-NLS-1$
-            + "first (it only affects launches started from this EDT instance), then retry."; //$NON-NLS-1$
+        return "Apply configuration changes to an application's database (infobase), full or " //$NON-NLS-1$
+            + "incremental. Target by launchConfigurationName (preferred) or projectName + " //$NON-NLS-1$
+            + "applicationId. Destructive/irreversible: guarded by a confirm-preview - call without " //$NON-NLS-1$
+            + "confirm to preview the exact update (no infobase change), then confirm=true to apply. " //$NON-NLS-1$
+            + "Terminate any running 1C client on the target infobase first (exclusive lock). " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('update_database')."; //$NON-NLS-1$
     }
 
     @Override
@@ -66,12 +63,36 @@ public class UpdateDatabaseTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .stringProperty("launchConfigurationName", //$NON-NLS-1$
-                "Exact EDT runtime-client launch configuration name (preferred; from list_configurations)") //$NON-NLS-1$
-            .stringProperty("projectName", "EDT project name (required if launchConfigurationName is omitted)") //$NON-NLS-1$ //$NON-NLS-2$
+                "Exact runtime-client config name from list_configurations (preferred target).") //$NON-NLS-1$
+            .stringProperty("projectName", //$NON-NLS-1$
+                "EDT project name; required if launchConfigurationName is omitted.") //$NON-NLS-1$
             .stringProperty("applicationId", //$NON-NLS-1$
-                "Application ID from get_applications (required if launchConfigurationName is omitted)") //$NON-NLS-1$
-            .booleanProperty("fullUpdate", "If true - full reload, if false - incremental update (default: false)") //$NON-NLS-1$ //$NON-NLS-2$
-            .booleanProperty("autoRestructure", "Automatically apply restructurization if needed (default: true)") //$NON-NLS-1$ //$NON-NLS-2$
+                "Application ID from get_applications; required if launchConfigurationName is omitted.") //$NON-NLS-1$
+            .booleanProperty("fullUpdate", //$NON-NLS-1$
+                "true = full reload, false = incremental (default false).") //$NON-NLS-1$
+            .booleanProperty("autoRestructure", //$NON-NLS-1$
+                "Auto-apply restructurization when needed (default true).") //$NON-NLS-1$
+            .booleanProperty("confirm", //$NON-NLS-1$
+                "true = apply the update; default false = preview only (resolves the target and " //$NON-NLS-1$
+                + "reports what would change WITHOUT mutating the infobase).") //$NON-NLS-1$
+            .build();
+    }
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("action", "Either 'preview' (nothing changed) or 'updated' (applied).") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("confirmationRequired", //$NON-NLS-1$
+                "true on a preview (no infobase change made); absent/false once updated.") //$NON-NLS-1$
+            .stringProperty("project", "Target EDT project name.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("applicationId", "Target application ID.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("applicationName", "Display name of the target application.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("updateType", "Update mode applied: FULL or INCREMENTAL.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("stateBefore", "Application update state before the update.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("stateAfter", "Application update state after the update.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("message", "Human-readable status message for the update.") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
 
@@ -89,6 +110,7 @@ public class UpdateDatabaseTool implements IMcpTool
         String applicationId = JsonUtils.extractStringArgument(params, "applicationId"); //$NON-NLS-1$
         boolean fullUpdate = JsonUtils.extractBooleanArgument(params, "fullUpdate", false); //$NON-NLS-1$
         boolean autoRestructure = JsonUtils.extractBooleanArgument(params, "autoRestructure", true); //$NON-NLS-1$
+        boolean confirm = JsonUtils.extractBooleanArgument(params, "confirm", false); //$NON-NLS-1$
 
         boolean hasName = configName != null && !configName.isEmpty();
         if (!hasName)
@@ -136,14 +158,15 @@ public class UpdateDatabaseTool implements IMcpTool
             applicationId = cfgAppId;
         }
 
-        // Check if project is ready for operations
-        String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-        if (notReadyError != null)
+        // Refuse only the transient BUILDING state; a missing/closed project falls through
+        // to the value-naming "Project not found" below.
+        String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+        if (building != null)
         {
-            return ToolResult.error(notReadyError).toJson();
+            return ToolResult.error(building).toJson();
         }
 
-        return updateDatabase(projectName, applicationId, fullUpdate, autoRestructure);
+        return updateDatabase(projectName, applicationId, fullUpdate, autoRestructure, confirm);
     }
     
     /**
@@ -155,24 +178,23 @@ public class UpdateDatabaseTool implements IMcpTool
      * @param autoRestructure whether to auto-apply restructurization
      * @return JSON string with result
      */
-    private String updateDatabase(String projectName, String applicationId, 
-            boolean fullUpdate, boolean autoRestructure)
+    private String updateDatabase(String projectName, String applicationId,
+            boolean fullUpdate, boolean autoRestructure, boolean confirm)
     {
         try
         {
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
-            IProject project = workspace.getRoot().getProject(projectName);
-            
-            if (project == null || !project.exists())
+            ProjectContext ctx = ProjectContext.of(projectName);
+            if (!ctx.exists())
             {
-                return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+                return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
             }
-            
-            if (!project.isOpen())
+
+            if (!ctx.isOpen())
             {
                 return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
             }
-            
+            IProject project = ctx.project();
+
             // Get application manager
             IApplicationManager appManager = Activator.getDefault().getApplicationManager();
             if (appManager == null)
@@ -198,10 +220,31 @@ public class UpdateDatabaseTool implements IMcpTool
             }
             
             // Determine update type
-            ApplicationUpdateType updateType = fullUpdate 
-                    ? ApplicationUpdateType.FULL 
+            ApplicationUpdateType updateType = fullUpdate
+                    ? ApplicationUpdateType.FULL
                     : ApplicationUpdateType.INCREMENTAL;
-            
+
+            // Confirm-preview gate (mirrors delete_metadata): a bare call
+            // resolves the target and reports the exact IRREVERSIBLE action WITHOUT touching the
+            // infobase; only confirm=true actually applies it. All validation above (project open,
+            // application exists, not already being updated) has run, so the preview is trustworthy.
+            if (!confirm)
+            {
+                return ToolResult.success()
+                    .put("action", "preview") //$NON-NLS-1$ //$NON-NLS-2$
+                    .put("confirmationRequired", true) //$NON-NLS-1$
+                    .put("project", projectName) //$NON-NLS-1$
+                    .put("applicationId", applicationId) //$NON-NLS-1$
+                    .put("applicationName", application.getName()) //$NON-NLS-1$
+                    .put("updateType", updateType.name()) //$NON-NLS-1$
+                    .put("stateBefore", stateBefore.name()) //$NON-NLS-1$
+                    .put("message", "PREVIEW: this would apply a " + updateType.name() //$NON-NLS-1$ //$NON-NLS-2$
+                        + " configuration update to the database of application '" + application.getName() //$NON-NLS-1$
+                        + "' (project " + projectName + "). This mutates the infobase and is " //$NON-NLS-1$ //$NON-NLS-2$
+                        + "IRREVERSIBLE. Re-call with confirm=true to apply it.") //$NON-NLS-1$
+                    .toJson();
+            }
+
             // Create execution context with the active Shell so EDT can parent
             // its dialogs. Shared SWT-grab lives in LaunchLifecycleUtils.
             ExecutionContext context = new ExecutionContext();
@@ -224,6 +267,7 @@ public class UpdateDatabaseTool implements IMcpTool
             
             // Build result
             ToolResult result = ToolResult.success()
+                .put("action", "updated") //$NON-NLS-1$ //$NON-NLS-2$
                 .put("project", projectName) //$NON-NLS-1$
                 .put("applicationId", applicationId) //$NON-NLS-1$
                 .put("applicationName", application.getName()) //$NON-NLS-1$

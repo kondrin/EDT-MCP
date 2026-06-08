@@ -6,61 +6,35 @@
 
 package com.ditrix.edt.mcp.server.tools.impl;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
-import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
-import org.eclipse.debug.core.DebugPlugin;
-import org.eclipse.debug.core.ILaunch;
-import org.eclipse.debug.core.ILaunchConfiguration;
-import org.eclipse.debug.core.ILaunchConfigurationWorkingCopy;
-import org.eclipse.debug.core.ILaunchManager;
 
-import com.ditrix.edt.mcp.server.Activator;
-import com.ditrix.edt.mcp.server.protocol.GsonProvider;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
-import com.ditrix.edt.mcp.server.protocol.JsonUtils;
-import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
-import com.ditrix.edt.mcp.server.utils.DebugSessionRegistry;
-import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
-import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
-import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils.PreLaunchResult;
-import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
-import com.e1c.g5.dt.applications.ApplicationException;
-import com.e1c.g5.dt.applications.IApplication;
-import com.e1c.g5.dt.applications.IApplicationManager;
 
 /**
- * Launches YAXUnit tests in <strong>DEBUG mode</strong> so that breakpoints
- * set via {@code set_breakpoint} actually trip when the test runs the code
- * under inspection.
+ * Deprecated alias for {@code run_yaxunit_tests} with {@code debug=true}.
  *
- * <p>Unlike {@code run_yaxunit_tests}, this tool does NOT poll for {@code junit.xml}.
- * After the launch is queued, control returns to the caller immediately and the
- * LLM is expected to call {@code wait_for_break} next. The full debug cycle is:
+ * <p>The two tools were near-twins (identical launch selector + filter
+ * parameters; the only difference was the launch mode), so they were merged
+ * behind a {@code debug} flag on {@code run_yaxunit_tests}. This tool is kept as
+ * a thin backward-compatible alias: it forwards its arguments to
+ * {@code run_yaxunit_tests} with {@code debug=true} and returns the same
+ * Markdown launch handle (which points at {@code wait_for_break}).
  *
- * <pre>
- *   set_breakpoint → debug_yaxunit_tests → wait_for_break
- *   → get_variables / evaluate_expression / step → resume
- * </pre>
- *
- * <p>The junit.xml report still gets written to the same {@code reportDir} the
- * tool returns, so a follow-up call to {@code run_yaxunit_tests} (or any file
- * read) can pick it up after the test finishes.
+ * @deprecated prefer {@code run_yaxunit_tests} with {@code debug=true}.
  */
+@Deprecated
 public class DebugYaxunitTestsTool implements IMcpTool
 {
     public static final String NAME = "debug_yaxunit_tests"; //$NON-NLS-1$
-    private static final AtomicLong LAUNCH_COUNTER = new AtomicLong(0);
+
+    /**
+     * The merged implementation. A fresh instance is fine — all of
+     * {@code RunYaxunitTestsTool}'s launch state is static, so this shares the
+     * same active-launch registry as the registered {@code run_yaxunit_tests}.
+     */
+    private static final RunYaxunitTestsTool DELEGATE = new RunYaxunitTestsTool();
 
     @Override
     public String getName()
@@ -71,12 +45,10 @@ public class DebugYaxunitTestsTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Launch YAXUnit tests in DEBUG mode so breakpoints fire. " //$NON-NLS-1$
-            + "Returns immediately after the launch is queued — call wait_for_break next " //$NON-NLS-1$
-            + "to block until a breakpoint is hit, then inspect with get_variables / " //$NON-NLS-1$
-            + "evaluate_expression / step / resume. " //$NON-NLS-1$
-            + "Use a tight tests filter (single test method) to make the cycle predictable. " //$NON-NLS-1$
-            + "Requires an existing 1C launch configuration and YAXUnit installed in the infobase."; //$NON-NLS-1$
+        return "Deprecated alias for run_yaxunit_tests with debug=true. Launches YAXUnit tests in DEBUG " //$NON-NLS-1$
+            + "mode so breakpoints fire, then call wait_for_break to inspect. Prefer " //$NON-NLS-1$
+            + "run_yaxunit_tests(debug=true) — identical behaviour. " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('debug_yaxunit_tests')."; //$NON-NLS-1$
     }
 
     @Override
@@ -84,258 +56,44 @@ public class DebugYaxunitTestsTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .stringProperty("launchConfigurationName", //$NON-NLS-1$
-                "Exact EDT runtime-client launch configuration name (preferred; from list_configurations)") //$NON-NLS-1$
-            .stringProperty("projectName", "EDT project name (required if launchConfigurationName is omitted)") //$NON-NLS-1$ //$NON-NLS-2$
+                "Exact runtime-client launch config name (preferred; from list_configurations).") //$NON-NLS-1$
+            .stringProperty("projectName", "EDT project name (required if launchConfigurationName is omitted).") //$NON-NLS-1$ //$NON-NLS-2$
             .stringProperty("applicationId", //$NON-NLS-1$
-                "Application id from get_applications (required if launchConfigurationName is omitted)") //$NON-NLS-1$
-            .stringProperty("extensions", "Comma-separated extension names to filter tests by extension") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("modules", "Comma-separated module names to filter tests") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("tests", "Comma-separated test names in Module.Method format (recommended: pin to one test)") //$NON-NLS-1$ //$NON-NLS-2$
+                "Application id from get_applications (required if launchConfigurationName is omitted).") //$NON-NLS-1$
+            .stringProperty("extensions", "Comma-separated extension names to filter tests by extension.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("modules", "Comma-separated module names to filter tests.") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("tests", //$NON-NLS-1$
+                "Comma-separated test names as Module.Method (recommended: pin to one test for a predictable cycle).") //$NON-NLS-1$
             .booleanProperty("updateBeforeLaunch", //$NON-NLS-1$
-                "Auto-chain (default: true): before spawning the debug launch, " //$NON-NLS-1$
-                    + "politely terminate any live 1С client running this configuration " //$NON-NLS-1$
-                    + "and run a silent DB update — so EDT's launch delegate does not pop " //$NON-NLS-1$
-                    + "its modal 'Update database?' dialog that would block the MCP call. " //$NON-NLS-1$
-                    + "Set false to keep legacy behaviour (delegate decides; dialog may appear).") //$NON-NLS-1$
+                "Default true: terminate any live client and run a silent DB update first so no modal " //$NON-NLS-1$
+                    + "'Update database?' dialog blocks the call; false keeps legacy delegate behaviour.") //$NON-NLS-1$
             .build();
-    }
-
-    @Override
-    public ResponseType getResponseType()
-    {
-        return ResponseType.JSON;
     }
 
     @Override
     public String execute(Map<String, String> params)
     {
-        String configName = JsonUtils.extractStringArgument(params, "launchConfigurationName"); //$NON-NLS-1$
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
-        String applicationId = JsonUtils.extractStringArgument(params, "applicationId"); //$NON-NLS-1$
-        String extensions = JsonUtils.extractStringArgument(params, "extensions"); //$NON-NLS-1$
-        String modules = JsonUtils.extractStringArgument(params, "modules"); //$NON-NLS-1$
-        String tests = JsonUtils.extractStringArgument(params, "tests"); //$NON-NLS-1$
-        boolean updateBeforeLaunch = JsonUtils.extractBooleanArgument(params, //$NON-NLS-1$
-            "updateBeforeLaunch", true); //$NON-NLS-1$
-
-        boolean hasName = configName != null && !configName.isEmpty();
-        if (!hasName)
-        {
-            if (projectName == null || projectName.isEmpty())
-            {
-                return ToolResult.error("projectName is required (or pass launchConfigurationName)").toJson(); //$NON-NLS-1$
-            }
-            if (applicationId == null || applicationId.isEmpty())
-            {
-                return ToolResult.error("applicationId is required (or pass launchConfigurationName)").toJson(); //$NON-NLS-1$
-            }
-        }
-
-        try
-        {
-            ILaunchManager launchManager = DebugPlugin.getDefault().getLaunchManager();
-            if (launchManager == null)
-            {
-                return ToolResult.error("Launch manager is not available").toJson(); //$NON-NLS-1$
-            }
-
-            ILaunchConfiguration matchingConfig = LaunchConfigUtils.resolveLaunchConfig(
-                launchManager, configName, projectName, applicationId);
-            if (matchingConfig == null)
-            {
-                return ToolResult.error(hasName
-                    ? "Launch configuration not found: '" + configName + "'" //$NON-NLS-1$ //$NON-NLS-2$
-                    : "No runtime-client launch configuration for project '" + projectName //$NON-NLS-1$
-                        + "' and application '" + applicationId //$NON-NLS-1$
-                        + "'. Use list_configurations to see what's available.").toJson(); //$NON-NLS-1$
-            }
-
-            if (!LaunchConfigUtils.LAUNCH_CONFIG_TYPE_ID.equals(LaunchConfigUtils.getConfigTypeId(matchingConfig)))
-            {
-                return ToolResult.error("Launch configuration '" + matchingConfig.getName() //$NON-NLS-1$
-                    + "' is not a runtime-client config — YAXUnit tests require one.").toJson(); //$NON-NLS-1$
-            }
-
-            // Derive effective project/application from the resolved config so
-            // subsequent validation and the success response match reality.
-            String effectiveProject = LaunchConfigUtils.readAttribute(matchingConfig,
-                LaunchConfigUtils.ATTR_PROJECT_NAME, ""); //$NON-NLS-1$
-            String effectiveAppId = LaunchConfigUtils.readAttribute(matchingConfig,
-                LaunchConfigUtils.ATTR_APPLICATION_ID, ""); //$NON-NLS-1$
-            if (projectName == null || projectName.isEmpty())
-            {
-                projectName = effectiveProject;
-            }
-            if (applicationId == null || applicationId.isEmpty())
-            {
-                applicationId = effectiveAppId;
-            }
-
-            if (projectName == null || projectName.isEmpty())
-            {
-                return ToolResult.error("Launch configuration '" + matchingConfig.getName() //$NON-NLS-1$
-                    + "' has no project attribute set").toJson(); //$NON-NLS-1$
-            }
-
-            String notReady = ProjectStateChecker.checkReadyOrError(projectName);
-            if (notReady != null)
-            {
-                return ToolResult.error(notReady).toJson();
-            }
-
-            IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-            if (project == null || !project.exists())
-            {
-                return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
-            }
-            if (!project.isOpen())
-            {
-                return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
-            }
-
-            IApplicationManager appManager = Activator.getDefault().getApplicationManager();
-            if (appManager == null)
-            {
-                return ToolResult.error("IApplicationManager service not available").toJson(); //$NON-NLS-1$
-            }
-            if (applicationId != null && !applicationId.isEmpty())
-            {
-                try
-                {
-                    Optional<IApplication> appOpt = appManager.getApplication(project, applicationId);
-                    if (!appOpt.isPresent())
-                    {
-                        return ToolResult.error("Application not found: " + applicationId).toJson(); //$NON-NLS-1$
-                    }
-                }
-                catch (ApplicationException e)
-                {
-                    return ToolResult.error("Failed to validate application: " + e.getMessage()).toJson(); //$NON-NLS-1$
-                }
-            }
-
-            // Prepare a unique report dir + xUnitParams.json (uses native path separators
-            // because YAXUnit constructs file:// URIs and breaks on forward slashes on Windows).
-            Path reportDir = Paths.get(System.getProperty("java.io.tmpdir"), //$NON-NLS-1$
-                "edt-mcp-yaxunit-debug", projectName + "-" + System.currentTimeMillis() //$NON-NLS-1$ //$NON-NLS-2$
-                    + "-" + LAUNCH_COUNTER.getAndIncrement()); //$NON-NLS-1$
-            Files.createDirectories(reportDir);
-            Path paramsFile = reportDir.resolve("xUnitParams.json"); //$NON-NLS-1$
-            Path junitFile = reportDir.resolve("junit.xml"); //$NON-NLS-1$
-            String paramsJson = buildParamsJson(junitFile.toString(), extensions, modules, tests);
-            Files.write(paramsFile, paramsJson.getBytes(StandardCharsets.UTF_8));
-
-            // Make sure suspend listener is in place before the launch starts producing events.
-            DebugSessionRegistry.get().ensureListenerRegistered();
-
-            // Auto-chain + spawn under the per-key lock — closes the window
-            // between workingCopy.launch() and registerOwnedLaunch in which a
-            // concurrent call against the same IB could otherwise terminate
-            // this fresh debug launch. Different (project, applicationId) pairs
-            // run in parallel.
-            PreLaunchResult preLaunch = null;
-            synchronized (LaunchLifecycleUtils.lockFor(projectName, applicationId))
-            {
-                if (updateBeforeLaunch)
-                {
-                    int terminateTimeout = LaunchLifecycleUtils.getDefaultTerminateTimeoutSeconds();
-                    preLaunch = LaunchLifecycleUtils.prepareForFreshLaunch(launchManager, project,
-                        applicationId, appManager, terminateTimeout);
-                    if (!preLaunch.isOk())
-                    {
-                        return ToolResult.error("Pre-launch preparation failed: " //$NON-NLS-1$
-                            + preLaunch.getError()
-                            + ". If the previous launch is stuck, call terminate_launch " //$NON-NLS-1$
-                            + "with force=true and retry. As a last resort, pass " //$NON-NLS-1$
-                            + "updateBeforeLaunch=false — but the EDT launch delegate may " //$NON-NLS-1$
-                            + "then pop a modal dialog that blocks the MCP call.").toJson(); //$NON-NLS-1$
-                    }
-                }
-
-                ILaunchConfigurationWorkingCopy workingCopy = matchingConfig.getWorkingCopy();
-                String startupOption = "RunUnitTests=" + paramsFile.toString(); //$NON-NLS-1$
-                workingCopy.setAttribute(LaunchConfigUtils.ATTR_STARTUP_OPTION, startupOption);
-
-                Activator.logInfo("Launching YAXUnit tests in DEBUG mode: config=" + matchingConfig.getName() //$NON-NLS-1$
-                    + ", startup=" + startupOption); //$NON-NLS-1$
-
-                // Launch the working copy directly so our ATTR_STARTUP_OPTION mutation
-                // actually takes effect (DebugUITools.launch on a working copy can
-                // re-resolve to the saved config and silently drop our changes).
-                try
-                {
-                    ILaunch spawned = workingCopy.launch(ILaunchManager.DEBUG_MODE,
-                        new org.eclipse.core.runtime.NullProgressMonitor());
-                    // Register inside the per-key lock so a concurrent auto-chain
-                    // for the same IB sees this launch as owned and refuses to
-                    // terminate it.
-                    LaunchLifecycleUtils.registerOwnedLaunch(spawned);
-                }
-                catch (Exception ex)
-                {
-                    Activator.logError("Failed to launch YAXUnit in debug mode", ex); //$NON-NLS-1$
-                    return ToolResult.error("Launch failed: " + ex.getMessage()).toJson(); //$NON-NLS-1$
-                }
-            }
-
-            ToolResult result = ToolResult.success()
-                .put("launched", true) //$NON-NLS-1$
-                .put("projectName", projectName) //$NON-NLS-1$
-                .put("applicationId", applicationId) //$NON-NLS-1$
-                .put("reportDir", reportDir.toString()) //$NON-NLS-1$
-                .put("junitXml", junitFile.toString()) //$NON-NLS-1$
-                .put("nextStep", "call wait_for_break with the same applicationId"); //$NON-NLS-1$ //$NON-NLS-2$
-            if (preLaunch != null && preLaunch.getTerminatedCount() > 0)
-            {
-                result.put("preLaunch", preLaunch.summary()); //$NON-NLS-1$
-            }
-            return result.toJson();
-        }
-        catch (Exception e)
-        {
-            Activator.logError("Unexpected error in debug_yaxunit_tests", e); //$NON-NLS-1$
-            return ToolResult.error("Unexpected error: " + e.getMessage()).toJson(); //$NON-NLS-1$
-        }
+        // Deprecated alias: forward the accepted arguments to the merged tool in
+        // DEBUG mode. Each key is copied by its literal name so this forwarding
+        // shim still satisfies schema/execute parity (rule #6), and the explicit
+        // list documents exactly what the alias accepts.
+        Map<String, String> forwarded = new HashMap<>();
+        putIfPresent(forwarded, "launchConfigurationName", params.get("launchConfigurationName")); //$NON-NLS-1$ //$NON-NLS-2$
+        putIfPresent(forwarded, "projectName", params.get("projectName")); //$NON-NLS-1$ //$NON-NLS-2$
+        putIfPresent(forwarded, "applicationId", params.get("applicationId")); //$NON-NLS-1$ //$NON-NLS-2$
+        putIfPresent(forwarded, "extensions", params.get("extensions")); //$NON-NLS-1$ //$NON-NLS-2$
+        putIfPresent(forwarded, "modules", params.get("modules")); //$NON-NLS-1$ //$NON-NLS-2$
+        putIfPresent(forwarded, "tests", params.get("tests")); //$NON-NLS-1$ //$NON-NLS-2$
+        putIfPresent(forwarded, "updateBeforeLaunch", params.get("updateBeforeLaunch")); //$NON-NLS-1$ //$NON-NLS-2$
+        forwarded.put("debug", "true"); //$NON-NLS-1$ //$NON-NLS-2$
+        return DELEGATE.execute(forwarded);
     }
 
-    private static String buildParamsJson(String reportPath, String extensions, String modules, String tests)
+    private static void putIfPresent(Map<String, String> target, String key, String value)
     {
-        Map<String, Object> p = new LinkedHashMap<>();
-        p.put("reportPath", reportPath); //$NON-NLS-1$
-        p.put("reportFormat", "jUnit"); //$NON-NLS-1$ //$NON-NLS-2$
-        p.put("closeAfterTests", true); //$NON-NLS-1$
-        Map<String, Object> filter = new LinkedHashMap<>();
-        boolean hasFilter = false;
-        if (extensions != null && !extensions.isEmpty())
+        if (value != null)
         {
-            filter.put("extensions", split(extensions)); //$NON-NLS-1$
-            hasFilter = true;
+            target.put(key, value);
         }
-        if (modules != null && !modules.isEmpty())
-        {
-            filter.put("modules", split(modules)); //$NON-NLS-1$
-            hasFilter = true;
-        }
-        if (tests != null && !tests.isEmpty())
-        {
-            filter.put("tests", split(tests)); //$NON-NLS-1$
-            hasFilter = true;
-        }
-        if (hasFilter)
-        {
-            p.put("filter", filter); //$NON-NLS-1$
-        }
-        return GsonProvider.toJson(p);
-    }
-
-    private static List<String> split(String csv)
-    {
-        List<String> out = new ArrayList<>();
-        for (String s : csv.split(",")) //$NON-NLS-1$
-        {
-            String t = s.trim();
-            if (!t.isEmpty()) out.add(t);
-        }
-        return out;
     }
 }

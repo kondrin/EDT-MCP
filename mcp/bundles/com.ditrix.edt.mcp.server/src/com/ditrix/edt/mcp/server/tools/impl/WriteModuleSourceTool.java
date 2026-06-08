@@ -18,14 +18,17 @@ import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IFolder;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
-import org.eclipse.core.resources.ResourcesPlugin;
-import org.eclipse.core.runtime.Path;
 
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.ContentHash;
 import com.ditrix.edt.mcp.server.utils.FrontMatter;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.MetadataTypeUtils;
+import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
+import com.ditrix.edt.mcp.server.utils.BslSyntaxChecker;
 
 /**
  * Tool to write BSL source code to 1C metadata object modules.
@@ -56,13 +59,12 @@ public class WriteModuleSourceTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Write BSL source code to 1C metadata object modules. " + //$NON-NLS-1$
-            "Modes: searchReplace (find oldSource and replace with source, default), " + //$NON-NLS-1$
-            "replace (replace entire file), append (add to end). " + //$NON-NLS-1$
-            "Specify modulePath or objectName + moduleType. " + //$NON-NLS-1$
-            "Automatically checks BSL syntax (balanced Procedure/EndProcedure, " + //$NON-NLS-1$
-            "Function/EndFunction, If/EndIf, etc.) before writing — " + //$NON-NLS-1$
-            "blocks write on errors. Pass skipSyntaxCheck=true to force."; //$NON-NLS-1$
+        return "Write BSL source code to a 1C metadata object module. " + //$NON-NLS-1$
+            "Use to edit a module: searchReplace a fragment (default, needs oldSource), " + //$NON-NLS-1$
+            "replace the whole file, or append. " + //$NON-NLS-1$
+            "Target the module by EITHER modulePath OR objectName (mutually exclusive — pass exactly one). " + //$NON-NLS-1$
+            "Runs a BSL syntax check before writing (skipSyntaxCheck=true to force). " + //$NON-NLS-1$
+            "Full parameters and examples: call get_tool_guide('write_module_source')."; //$NON-NLS-1$
     }
 
     @Override
@@ -72,41 +74,34 @@ public class WriteModuleSourceTool implements IMcpTool
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringProperty("modulePath", //$NON-NLS-1$
-                "Path to module from src/ folder, e.g. " + //$NON-NLS-1$
-                "'Documents/MyDoc/ObjectModule.bsl' or " + //$NON-NLS-1$
-                "'CommonModules/MyModule/Module.bsl'. " + //$NON-NLS-1$
-                "Alternative: use objectName + moduleType.") //$NON-NLS-1$
+                "src/-relative module path, e.g. 'CommonModules/MyModule/Module.bsl'. " + //$NON-NLS-1$
+                "Alternative to objectName (pass exactly one).") //$NON-NLS-1$
             .stringProperty("objectName", //$NON-NLS-1$
-                "Full object name, e.g. 'Document.MyDoc', " + //$NON-NLS-1$
-                "'DataProcessor.MyProcessor'. " + //$NON-NLS-1$
-                "Supports Russian names (e.g. 'Документ.МойДок'). " + //$NON-NLS-1$
-                "Alternative to modulePath.") //$NON-NLS-1$
-            .stringProperty("moduleType", //$NON-NLS-1$
-                "Module type (used with objectName): ObjectModule (default), " + //$NON-NLS-1$
-                "ManagerModule, FormModule, CommandModule, RecordSetModule.") //$NON-NLS-1$
+                "Object name 'Type.Name', e.g. 'Document.MyDoc'. " + //$NON-NLS-1$
+                "Resolved with moduleType. Alternative to modulePath.") //$NON-NLS-1$
+            .enumProperty("moduleType", //$NON-NLS-1$
+                "Module type for objectName resolution (default ObjectModule).", //$NON-NLS-1$
+                "ObjectModule", "ManagerModule", "FormModule", "CommandModule", "RecordSetModule", "Module") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
             .stringProperty("source", //$NON-NLS-1$
-                "BSL source code to write (required). " + //$NON-NLS-1$
-                "For replace: complete module content. " + //$NON-NLS-1$
-                "For searchReplace: new code replacing oldSource. " + //$NON-NLS-1$
-                "For append: code to add.", true) //$NON-NLS-1$
+                "BSL source to write (required): full file for replace, new fragment for " + //$NON-NLS-1$
+                "searchReplace, text to add for append.", true) //$NON-NLS-1$
             .stringProperty("oldSource", //$NON-NLS-1$
-                "Existing code to find and replace (required for searchReplace mode). " + //$NON-NLS-1$
-                "Must match exactly one location in the file. " + //$NON-NLS-1$
-                "Proves that you have read the current file content.") //$NON-NLS-1$
-            .stringProperty("mode", //$NON-NLS-1$
-                "Write mode: 'searchReplace' (find oldSource and replace with source, default), " + //$NON-NLS-1$
-                "'replace' (replace entire file), 'append' (add to end).") //$NON-NLS-1$
+                "Fragment to find and replace; required for searchReplace, must match exactly once.") //$NON-NLS-1$
+            .enumProperty("mode", //$NON-NLS-1$
+                "Write mode (default searchReplace).", //$NON-NLS-1$
+                "searchReplace", "replace", "append") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             .stringProperty("formName", //$NON-NLS-1$
-                "Form name, required when moduleType=FormModule " + //$NON-NLS-1$
-                "(e.g. 'ItemForm').") //$NON-NLS-1$
+                "Form name; required when moduleType=FormModule (e.g. 'ItemForm').") //$NON-NLS-1$
             .stringProperty("commandName", //$NON-NLS-1$
-                "Command name, required when moduleType=CommandModule " + //$NON-NLS-1$
-                "(e.g. 'FillByTemplate').") //$NON-NLS-1$
+                "Command name; required when moduleType=CommandModule (e.g. 'FillByTemplate').") //$NON-NLS-1$
             .booleanProperty("skipSyntaxCheck", //$NON-NLS-1$
-                "Skip BSL syntax validation (default: false). " + //$NON-NLS-1$
-                "By default, checks balanced Procedure/EndProcedure, " + //$NON-NLS-1$
-                "Function/EndFunction, If/EndIf, While/EndDo, " + //$NON-NLS-1$
-                "For/EndDo, Try/EndTry. Set true to force write.") //$NON-NLS-1$
+                "Skip the BSL syntax check (default false).") //$NON-NLS-1$
+            .stringProperty("expectedSource", //$NON-NLS-1$
+                "Lost-update guard for mode=replace: the module content you last read; mismatch rejects.") //$NON-NLS-1$
+            .booleanProperty("overwrite", //$NON-NLS-1$
+                "Force mode=replace over an existing module without an expectedSource check (default false).") //$NON-NLS-1$
+            .stringProperty("expectedHash", //$NON-NLS-1$
+                "Lost-update guard for any mode: the contentHash from your last read; mismatch rejects.") //$NON-NLS-1$
             .build();
     }
 
@@ -142,19 +137,23 @@ public class WriteModuleSourceTool implements IMcpTool
         String formName = JsonUtils.extractStringArgument(params, "formName"); //$NON-NLS-1$
         String commandName = JsonUtils.extractStringArgument(params, "commandName"); //$NON-NLS-1$
         boolean skipSyntaxCheck = JsonUtils.extractBooleanArgument(params, "skipSyntaxCheck", false); //$NON-NLS-1$
+        String expectedSource = JsonUtils.extractStringArgument(params, "expectedSource"); //$NON-NLS-1$
+        boolean overwrite = JsonUtils.extractBooleanArgument(params, "overwrite", false); //$NON-NLS-1$
+        String expectedHash = JsonUtils.extractStringArgument(params, "expectedHash"); //$NON-NLS-1$
 
         // 2. Validate required parameters
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return "Error: projectName is required"; //$NON-NLS-1$
+            return err;
         }
         if (source == null)
         {
-            return "Error: source is required"; //$NON-NLS-1$
+            return ToolResult.error("source is required").toJson(); //$NON-NLS-1$
         }
         if (source.length() > MAX_SOURCE_LENGTH)
         {
-            return "Error: source exceeds maximum allowed length (" + MAX_SOURCE_LENGTH + " characters)"; //$NON-NLS-1$ //$NON-NLS-2$
+            return ToolResult.error("source exceeds maximum allowed length (" + MAX_SOURCE_LENGTH + " characters)").toJson(); //$NON-NLS-1$ //$NON-NLS-2$
         }
 
         // Default mode
@@ -167,8 +166,8 @@ public class WriteModuleSourceTool implements IMcpTool
         if (!MODE_REPLACE.equals(mode) && !MODE_APPEND.equals(mode)
             && !MODE_SEARCH_REPLACE.equals(mode))
         {
-            return "Error: invalid mode '" + mode + "'. " + //$NON-NLS-1$ //$NON-NLS-2$
-                "Allowed: searchReplace, replace, append"; //$NON-NLS-1$
+            return ToolResult.error("invalid mode '" + mode + "'. " + //$NON-NLS-1$ //$NON-NLS-2$
+                "Allowed: searchReplace, replace, append").toJson(); //$NON-NLS-1$
         }
 
         // Validate oldSource for searchReplace mode
@@ -176,20 +175,42 @@ public class WriteModuleSourceTool implements IMcpTool
         {
             if (oldSource == null || oldSource.isEmpty())
             {
-                return "Error: oldSource is required for searchReplace mode"; //$NON-NLS-1$
+                return ToolResult.error("oldSource is required for searchReplace mode").toJson(); //$NON-NLS-1$
             }
         }
 
-        // 3. Resolve modulePath
-        if (modulePath == null || modulePath.isEmpty())
+        // 3. Resolve the module target. modulePath and objectName form an exclusive
+        // OR (a flat Map schema cannot express XOR, so it is enforced here): exactly
+        // one must be given. moduleType is a decorator on the objectName path only —
+        // it is meaningless with an explicit modulePath, so flag it instead of
+        // silently ignoring it. formName/commandName are validated deeper in
+        // resolveModulePath (they depend on the resolved moduleType).
+        boolean hasModulePath = modulePath != null && !modulePath.isEmpty();
+        boolean hasObjectName = objectName != null && !objectName.isEmpty();
+        boolean hasModuleType = moduleType != null && !moduleType.isEmpty();
+
+        if (hasModulePath && hasObjectName)
         {
-            if (objectName == null || objectName.isEmpty())
-            {
-                return "Error: either modulePath or objectName is required"; //$NON-NLS-1$
-            }
+            return ToolResult.error("modulePath and objectName are mutually exclusive; " + //$NON-NLS-1$
+                "pass only one (modulePath for a direct path, or objectName to resolve it)").toJson(); //$NON-NLS-1$
+        }
+        if (!hasModulePath && !hasObjectName)
+        {
+            return ToolResult.error("either modulePath or objectName is required").toJson(); //$NON-NLS-1$
+        }
+        if (hasModulePath && hasModuleType)
+        {
+            return ToolResult.error("moduleType applies only with objectName; " + //$NON-NLS-1$
+                "it is meaningless with an explicit modulePath, so drop one of them").toJson(); //$NON-NLS-1$
+        }
+
+        if (!hasModulePath)
+        {
             String resolved = resolveModulePath(objectName, moduleType, formName, commandName);
-            if (resolved.startsWith("Error:")) //$NON-NLS-1$
+            if (isErrorJson(resolved))
             {
+                // resolveModulePath signals failure by returning a ready
+                // ToolResult.error(...).toJson() payload; surface it as-is.
                 return resolved;
             }
             modulePath = resolved;
@@ -198,31 +219,32 @@ public class WriteModuleSourceTool implements IMcpTool
         // Validate modulePath: prevent path traversal
         if (modulePath.contains("..")) //$NON-NLS-1$
         {
-            return "Error: modulePath must not contain '..'"; //$NON-NLS-1$
+            return ToolResult.error("modulePath must not contain '..'").toJson(); //$NON-NLS-1$
         }
 
         // Validate modulePath: only .bsl files allowed
         if (!modulePath.endsWith(".bsl")) //$NON-NLS-1$
         {
-            return "Error: only .bsl module files can be written"; //$NON-NLS-1$
+            return ToolResult.error("only .bsl module files can be written").toJson(); //$NON-NLS-1$
         }
 
         // 4. Validate project
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
 
         // 5. Get file
-        IFile file = project.getFile(new Path("src").append(modulePath)); //$NON-NLS-1$
+        IFile file = BslModuleUtils.resolveModuleFile(project, modulePath);
         boolean fileExists = file.exists();
 
         // For non-replace modes, file must exist
         if (!fileExists && !MODE_REPLACE.equals(mode))
         {
-            return "Error: File not found: src/" + modulePath + //$NON-NLS-1$
-                ". Only 'replace' mode can create new files."; //$NON-NLS-1$
+            return ToolResult.error("File not found: src/" + modulePath + //$NON-NLS-1$
+                ". Only 'replace' mode can create new files.").toJson(); //$NON-NLS-1$
         }
 
         try
@@ -244,6 +266,21 @@ public class WriteModuleSourceTool implements IMcpTool
                 hasBom = true; // New BSL files should have BOM
             }
 
+            // 6b. Optimistic-lock guard (any mode): when the caller carried an
+            // expectedHash from its last read, reject if the module changed since —
+            // a cheap lost-update check that complements searchReplace's oldSource
+            // match and replace's expectedSource. Read the canonical text the same way
+            // those guards do (readFileText, \n-normalized) so the hashes always agree;
+            // skipped entirely when no expectedHash is given.
+            String currentTextForHash = (expectedHash != null && !expectedHash.isEmpty() && fileExists)
+                ? BslModuleUtils.readFileText(file).replace("\r\n", "\n") //$NON-NLS-1$ //$NON-NLS-2$
+                : null;
+            String hashError = evaluateExpectedHash(currentTextForHash, expectedHash, fileExists);
+            if (hashError != null)
+            {
+                return hashError;
+            }
+
             // 7. Compute new content based on mode
             List<String> newLines;
             int totalOriginal = originalLines.size();
@@ -251,8 +288,27 @@ public class WriteModuleSourceTool implements IMcpTool
             switch (mode)
             {
                 case MODE_REPLACE:
+                {
+                    // Lost-update guard: overwriting an EXISTING module blindly
+                    // clobbers any edit made since the agent last read it. Creating a
+                    // NEW module is unconditional (nothing to lose).
+                    // A matching expectedHash is itself a valid lost-update precondition
+                    // (the whole-file token proves the agent saw the current state) and
+                    // was ALREADY validated at step 6b — so when one was supplied, the
+                    // expectedSource/overwrite precondition is satisfied and skipped.
+                    boolean hashGuardSatisfied = expectedHash != null && !expectedHash.isEmpty();
+                    if (fileExists && !hashGuardSatisfied)
+                    {
+                        String preconditionError =
+                            checkReplacePrecondition(file, expectedSource, overwrite);
+                        if (preconditionError != null)
+                        {
+                            return preconditionError;
+                        }
+                    }
                     newLines = splitSourceLines(source);
                     break;
+                }
 
                 case MODE_APPEND:
                     newLines = new ArrayList<>(originalLines);
@@ -264,39 +320,34 @@ public class WriteModuleSourceTool implements IMcpTool
                     // Normalize oldSource
                     oldSource = oldSource.replace("\r\n", "\n"); //$NON-NLS-1$ //$NON-NLS-2$
 
-                    // Join original lines into single string for content-based search
-                    String currentContent = String.join("\n", originalLines); //$NON-NLS-1$
+                    // Read the raw file content (preserves the trailing newline that
+                    // writeFile always adds). Reconstructing it from originalLines via
+                    // String.join dropped that final newline, so an oldSource fragment
+                    // that ended at EOF (including the final newline) was reported
+                    // "not found".
+                    String currentContent = BslModuleUtils.readFileText(file).replace("\r\n", "\n"); //$NON-NLS-1$ //$NON-NLS-2$
 
-                    // Find oldSource in current content
-                    int idx = currentContent.indexOf(oldSource);
-                    if (idx < 0)
+                    SearchReplaceResult sr = applySearchReplace(currentContent, oldSource, source);
+                    if (sr.occurrences == 0)
                     {
-                        return "Error: oldSource not found in current file content. " + //$NON-NLS-1$
+                        return ToolResult.error("oldSource not found in current file content. " + //$NON-NLS-1$
                             "The file may have changed since last read, or the oldSource text " + //$NON-NLS-1$
-                            "does not match exactly. Please read the file again with read_module_source."; //$NON-NLS-1$
+                            "does not match exactly. Please read the file again with read_module_source.").toJson(); //$NON-NLS-1$
                     }
-
-                    // Check for multiple occurrences
-                    int secondIdx = currentContent.indexOf(oldSource, idx + 1);
-                    if (secondIdx >= 0)
+                    if (sr.occurrences > 1)
                     {
-                        return "Error: oldSource found multiple times in the file (" + //$NON-NLS-1$
-                            countOccurrences(currentContent, oldSource) +
+                        return ToolResult.error("oldSource found multiple times in the file (" + //$NON-NLS-1$
+                            sr.occurrences +
                             " occurrences). Provide a larger, more specific oldSource fragment " + //$NON-NLS-1$
-                            "that matches exactly one location."; //$NON-NLS-1$
+                            "that matches exactly one location.").toJson(); //$NON-NLS-1$
                     }
 
-                    // Perform replacement
-                    String newContent = currentContent.substring(0, idx)
-                        + source
-                        + currentContent.substring(idx + oldSource.length());
-
-                    newLines = splitSourceLines(newContent);
+                    newLines = splitSourceLines(sr.newContent);
                     break;
                 }
 
                 default:
-                    return "Error: unsupported mode: " + mode; //$NON-NLS-1$
+                    return ToolResult.error("unsupported mode: " + mode).toJson(); //$NON-NLS-1$
             }
 
             // 8. BSL syntax check
@@ -306,14 +357,14 @@ public class WriteModuleSourceTool implements IMcpTool
                 if (!checkResult.isValid())
                 {
                     StringBuilder sb = new StringBuilder();
-                    sb.append("Error: BSL syntax check failed. Write blocked.\n\n"); //$NON-NLS-1$
-                    sb.append("**Errors:**\n"); //$NON-NLS-1$
+                    sb.append("BSL syntax check failed. Write blocked.\n\n"); //$NON-NLS-1$
+                    sb.append("Errors:\n"); //$NON-NLS-1$
                     for (String error : checkResult.getErrors())
                     {
                         sb.append("- ").append(error).append("\n"); //$NON-NLS-1$ //$NON-NLS-2$
                     }
                     sb.append("\nPass skipSyntaxCheck=true to force write."); //$NON-NLS-1$
-                    return sb.toString();
+                    return ToolResult.error(sb.toString()).toJson();
                 }
             }
 
@@ -344,14 +395,14 @@ public class WriteModuleSourceTool implements IMcpTool
         }
         catch (Exception e)
         {
-            return "Error writing file: " + e.getMessage(); //$NON-NLS-1$
+            return ToolResult.error("Failed to write file: " + e.getMessage()).toJson(); //$NON-NLS-1$
         }
     }
 
     /**
      * Counts the number of occurrences of a substring in a string.
      */
-    private int countOccurrences(String text, String search)
+    private static int countOccurrences(String text, String search)
     {
         int count = 0;
         int idx = 0;
@@ -364,7 +415,170 @@ public class WriteModuleSourceTool implements IMcpTool
     }
 
     /**
+     * Result of a pure content-based search/replace.
+     * {@code occurrences}: 0 = oldSource absent, 1 = replaced ({@code newContent}
+     * set), &gt;1 = ambiguous ({@code newContent} null).
+     */
+    static final class SearchReplaceResult
+    {
+        final int occurrences;
+        final String newContent;
+
+        SearchReplaceResult(int occurrences, String newContent)
+        {
+            this.occurrences = occurrences;
+            this.newContent = newContent;
+        }
+    }
+
+    /**
+     * Pure content-based search/replace used by MODE_SEARCH_REPLACE. Operating on
+     * the raw file content (which keeps the trailing newline) means an oldSource
+     * fragment that ends at EOF, including the final newline, is found. Returns
+     * occurrences=0 when absent and &gt;1 when ambiguous (newContent null in both),
+     * or 1 with the replaced content.
+     */
+    static SearchReplaceResult applySearchReplace(String currentContent, String oldSource, String newSource)
+    {
+        int idx = currentContent.indexOf(oldSource);
+        if (idx < 0)
+        {
+            return new SearchReplaceResult(0, null);
+        }
+        int secondIdx = currentContent.indexOf(oldSource, idx + 1);
+        if (secondIdx >= 0)
+        {
+            return new SearchReplaceResult(countOccurrences(currentContent, oldSource), null);
+        }
+        String newContent = currentContent.substring(0, idx) + newSource
+            + currentContent.substring(idx + oldSource.length());
+        return new SearchReplaceResult(1, newContent);
+    }
+
+    /**
+     * Lost-update precondition for {@code mode=replace} over an EXISTING module.
+     * mode=searchReplace is already protected by its {@code oldSource} content match;
+     * a full replace would otherwise blindly clobber whatever the module contains now,
+     * losing a concurrent edit (or one made between the agent's read and write).
+     * <p>
+     * Resolution:
+     * <ul>
+     * <li>{@code expectedSource} provided — compare it to the current module content;
+     *     on mismatch reject with a "read it again then retry" steer (mirrors the
+     *     searchReplace not-found steer), on match proceed.</li>
+     * <li>else {@code overwrite == true} — proceed (explicit force).</li>
+     * <li>else — reject and point at expectedSource / overwrite / searchReplace.</li>
+     * </ul>
+     * Content is compared on {@code \n}-normalized text (same normalization
+     * {@code source} and searchReplace use), so a CRLF/LF difference alone is not a
+     * spurious mismatch.
+     *
+     * @return {@code null} to proceed, or a ready {@link ToolResult#error} JSON
+     *     payload to return verbatim from {@link #execute}.
+     */
+    private static String checkReplacePrecondition(IFile file, String expectedSource,
+        boolean overwrite) throws Exception
+    {
+        // Read the raw module content (same normalization searchReplace uses) ONLY
+        // when an expectedSource has to be compared; otherwise the decision is purely
+        // overwrite vs reject and no file access is needed.
+        String currentContent = expectedSource == null
+            ? null
+            : BslModuleUtils.readFileText(file).replace("\r\n", "\n"); //$NON-NLS-1$ //$NON-NLS-2$
+        return evaluateReplacePrecondition(currentContent, expectedSource, overwrite);
+    }
+
+    /**
+     * Pure decision for the {@code mode=replace}-over-existing lost-update guard,
+     * split out so it is unit-testable without an Eclipse workspace (mirrors
+     * {@link #applySearchReplace}). {@code currentContent} is the {@code \n}-normalized
+     * current module content and may be {@code null} when {@code expectedSource} is
+     * {@code null} (no content comparison is performed in that branch).
+     *
+     * @return {@code null} to proceed, or a ready {@link ToolResult#error} JSON
+     *     payload to return verbatim from {@link #execute}.
+     */
+    static String evaluateReplacePrecondition(String currentContent, String expectedSource,
+        boolean overwrite)
+    {
+        if (expectedSource != null)
+        {
+            String expectedNormalized = expectedSource.replace("\r\n", "\n"); //$NON-NLS-1$ //$NON-NLS-2$
+            if (currentContent == null || !currentContent.equals(expectedNormalized))
+            {
+                return ToolResult.error("expectedSource does not match the current module content. " + //$NON-NLS-1$
+                    "The module changed since you read it (a concurrent edit), so a full replace " + //$NON-NLS-1$
+                    "would lose that change. Please read the file again with read_module_source, " + //$NON-NLS-1$
+                    "then retry with the up-to-date expectedSource.").toJson(); //$NON-NLS-1$
+            }
+            return null;
+        }
+        if (overwrite)
+        {
+            return null;
+        }
+        return ToolResult.error("module already exists; a full replace would overwrite it and " + //$NON-NLS-1$
+            "could lose a concurrent edit. Pass expectedSource (the content you last read with " + //$NON-NLS-1$
+            "read_module_source) to guard against a lost update, or overwrite=true to force, " + //$NON-NLS-1$
+            "or use mode=searchReplace to change only a fragment.").toJson(); //$NON-NLS-1$
+    }
+
+    /**
+     * Pure decision for the {@code expectedHash} optimistic-lock guard, split out so
+     * it is unit-testable without an Eclipse workspace (mirrors
+     * {@link #evaluateReplacePrecondition}). Applies to ANY write mode and is the cheap
+     * counterpart to {@code expectedSource}: the caller round-trips the opaque
+     * {@code contentHash} from a read tool, and a change since then is rejected with the
+     * same "read it again then retry" steer.
+     *
+     * @param currentContent the {@code \n}-normalized current module content, or
+     *     {@code null} when {@code expectedHash} is blank or the file does not exist
+     *     (no content comparison is performed in those branches)
+     * @param expectedHash the opaque token the caller carried over from its read; a
+     *     blank value disables the guard (backward compatible)
+     * @param fileExists whether the target module already exists on disk
+     * @return {@code null} to proceed, or a ready {@link ToolResult#error} JSON payload
+     *     to return verbatim from {@link #execute}
+     */
+    static String evaluateExpectedHash(String currentContent, String expectedHash, boolean fileExists)
+    {
+        if (expectedHash == null || expectedHash.isEmpty())
+        {
+            return null;
+        }
+        if (!fileExists)
+        {
+            return ToolResult.error("expectedHash was provided but this module does not exist yet, " + //$NON-NLS-1$
+                "so there is nothing to match. To CREATE a new module omit expectedHash; otherwise the " + //$NON-NLS-1$
+                "path is wrong or the module was deleted — re-check with read_module_source.").toJson(); //$NON-NLS-1$
+        }
+        if (!ContentHash.matches(currentContent, expectedHash))
+        {
+            return ToolResult.error("expectedHash does not match the current module content. " + //$NON-NLS-1$
+                "The module changed since you read it (a concurrent edit), so writing now could lose " + //$NON-NLS-1$
+                "that change. Please read the file again with read_module_source and retry with the " + //$NON-NLS-1$
+                "up-to-date contentHash.").toJson(); //$NON-NLS-1$
+        }
+        return null;
+    }
+
+    /**
+     * Returns {@code true} when the given resolver result is a structured error
+     * payload (a {@link ToolResult#error} JSON object) rather than a resolved
+     * module path. A resolved path is a plain {@code src/}-relative string, so it
+     * can never begin with the JSON object opener.
+     */
+    private static boolean isErrorJson(String resolverResult)
+    {
+        return resolverResult.startsWith("{"); //$NON-NLS-1$
+    }
+
+    /**
      * Resolves objectName + moduleType to a module file path relative to src/.
+     * On success returns the plain path; on failure returns a ready
+     * {@link ToolResult#error} JSON payload (detected by {@link #isErrorJson})
+     * so the error reaches the client through the structured error contract
+     * rather than a bare "Error:" string.
      */
     private String resolveModulePath(String objectName, String moduleType,
         String formName, String commandName)
@@ -373,8 +587,8 @@ public class WriteModuleSourceTool implements IMcpTool
         int dotIndex = objectName.indexOf('.'); //$NON-NLS-1$
         if (dotIndex <= 0 || dotIndex >= objectName.length() - 1)
         {
-            return "Error: objectName must be in format 'Type.Name' " + //$NON-NLS-1$
-                "(e.g. 'Document.MyDoc', 'CommonModule.MyModule')"; //$NON-NLS-1$
+            return ToolResult.error("objectName must be in format 'Type.Name' " + //$NON-NLS-1$
+                "(e.g. 'Document.MyDoc', 'CommonModule.MyModule')").toJson(); //$NON-NLS-1$
         }
 
         String typePart = objectName.substring(0, dotIndex);
@@ -384,14 +598,14 @@ public class WriteModuleSourceTool implements IMcpTool
         String englishType = MetadataTypeUtils.toEnglishSingular(typePart);
         if (englishType == null)
         {
-            return "Error: unknown metadata type: " + typePart; //$NON-NLS-1$
+            return ToolResult.error("unknown metadata type: " + typePart).toJson(); //$NON-NLS-1$
         }
 
         // Get directory name
         String dirName = MetadataTypeUtils.getDirectoryName(typePart);
         if (dirName == null)
         {
-            return "Error: metadata type '" + typePart + "' has no source directory"; //$NON-NLS-1$ //$NON-NLS-2$
+            return ToolResult.error("metadata type '" + typePart + "' has no source directory").toJson(); //$NON-NLS-1$ //$NON-NLS-2$
         }
 
         // Determine default moduleType based on metadata type
@@ -437,7 +651,7 @@ public class WriteModuleSourceTool implements IMcpTool
                 }
                 if (formName == null || formName.isEmpty())
                 {
-                    return "Error: formName is required when moduleType=FormModule"; //$NON-NLS-1$
+                    return ToolResult.error("formName is required when moduleType=FormModule").toJson(); //$NON-NLS-1$
                 }
                 return dirName + "/" + namePart + "/Forms/" + formName + "/Module.bsl"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
 
@@ -449,14 +663,14 @@ public class WriteModuleSourceTool implements IMcpTool
                 }
                 if (commandName == null || commandName.isEmpty())
                 {
-                    return "Error: commandName is required when moduleType=CommandModule"; //$NON-NLS-1$
+                    return ToolResult.error("commandName is required when moduleType=CommandModule").toJson(); //$NON-NLS-1$
                 }
                 return dirName + "/" + namePart + "/Commands/" + commandName + "/CommandModule.bsl"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
 
             default:
-                return "Error: unknown moduleType: " + moduleType + //$NON-NLS-1$
+                return ToolResult.error("unknown moduleType: " + moduleType + //$NON-NLS-1$
                     ". Allowed: ObjectModule, ManagerModule, FormModule, " + //$NON-NLS-1$
-                    "CommandModule, RecordSetModule, Module"; //$NON-NLS-1$
+                    "CommandModule, RecordSetModule, Module").toJson(); //$NON-NLS-1$
         }
     }
 

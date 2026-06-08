@@ -1,4 +1,4 @@
-﻿/**
+/**
  * MCP Server for EDT
  * Copyright (C) 2025 DitriX (https://github.com/DitriXNew)
  * Licensed under AGPL-3.0-or-later
@@ -8,6 +8,7 @@ package com.ditrix.edt.mcp.server.tools.impl;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -35,8 +36,12 @@ import com._1c.g5.v8.dt.bsl.model.RegionPreprocessor;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
+import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
+import com.ditrix.edt.mcp.server.utils.InterceptionUtils;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool to get the structure of a BSL module: methods, signatures, regions, export flags.
@@ -44,6 +49,9 @@ import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
 public class GetModuleStructureTool implements IMcpTool
 {
     public static final String NAME = "get_module_structure"; //$NON-NLS-1$
+
+    private static final String FORMAT_CONCISE = "concise"; //$NON-NLS-1$
+    private static final String FORMAT_DETAILED = "detailed"; //$NON-NLS-1$
 
     @Override
     public String getName()
@@ -56,7 +64,12 @@ public class GetModuleStructureTool implements IMcpTool
     {
         return "Get structure of a BSL module: all procedures/functions with signatures, " + //$NON-NLS-1$
                "line numbers, regions, execution context (&AtServer, &AtClient), " + //$NON-NLS-1$
-               "export flag, and parameters."; //$NON-NLS-1$
+               "export flag, and parameters. " + //$NON-NLS-1$
+               "responseFormat=concise (default) returns a leaner methods table (drops the " + //$NON-NLS-1$
+               "verbose Parameters and Description columns; keeps type, name, export, context, " + //$NON-NLS-1$
+               "lines, region); responseFormat=detailed returns the full table with signatures " + //$NON-NLS-1$
+               "and doc-comments. Use detailed when you need parameter lists or descriptions. " + //$NON-NLS-1$
+               "Use this for the structure of ONE module; to discover module paths across a project use list_modules."; //$NON-NLS-1$
     }
 
     @Override
@@ -71,6 +84,10 @@ public class GetModuleStructureTool implements IMcpTool
                 "Include module-level variable declarations. Default: false") //$NON-NLS-1$
             .booleanProperty("includeComments", //$NON-NLS-1$
                 "Include documentation comments for methods. Default: false") //$NON-NLS-1$
+            .enumProperty("responseFormat", //$NON-NLS-1$
+                "Output verbosity. concise (default) = leaner methods table (drops Parameters " //$NON-NLS-1$
+                + "and Description columns); detailed = full table with signatures and doc-comments.", //$NON-NLS-1$
+                FORMAT_CONCISE, FORMAT_DETAILED)
             .build();
     }
 
@@ -99,14 +116,19 @@ public class GetModuleStructureTool implements IMcpTool
         String modulePath = JsonUtils.extractStringArgument(params, "modulePath"); //$NON-NLS-1$
         boolean includeVariables = JsonUtils.extractBooleanArgument(params, "includeVariables", false); //$NON-NLS-1$
         boolean includeComments = JsonUtils.extractBooleanArgument(params, "includeComments", false); //$NON-NLS-1$
+        // Output verbosity: any absent/blank/unrecognized value falls back to concise.
+        boolean detailed = FORMAT_DETAILED.equalsIgnoreCase(
+            JsonUtils.extractStringArgument(params, "responseFormat")); //$NON-NLS-1$
 
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return "Error: projectName is required"; //$NON-NLS-1$
+            return err;
         }
-        if (modulePath == null || modulePath.isEmpty())
+        err = JsonUtils.requireArgument(params, "modulePath", ". Example: 'CommonModules/MyModule/Module.bsl'"); //$NON-NLS-1$ //$NON-NLS-2$
+        if (err != null)
         {
-            return "Error: modulePath is required. Example: 'CommonModules/MyModule/Module.bsl'"; //$NON-NLS-1$
+            return err;
         }
 
         // Try EMF approach first (on UI thread)
@@ -116,7 +138,7 @@ public class GetModuleStructureTool implements IMcpTool
         display.syncExec(() -> {
             try
             {
-                String result = getStructureInternal(projectName, modulePath, includeVariables, includeComments);
+                String result = getStructureInternal(projectName, modulePath, includeVariables, includeComments, detailed);
                 resultRef.set(result);
             }
             catch (Exception e)
@@ -132,30 +154,37 @@ public class GetModuleStructureTool implements IMcpTool
             return result;
         }
 
-        return "Error: BSL model is not available for '" + modulePath + "'\n" + //$NON-NLS-1$ //$NON-NLS-2$
-               "Make sure project '" + projectName + "' is open and fully indexed in EDT."; //$NON-NLS-1$ //$NON-NLS-2$
+        return ToolResult.error("BSL model is not available for '" + modulePath + "'\n" + //$NON-NLS-1$ //$NON-NLS-2$
+               "Make sure project '" + projectName + "' is open and fully indexed in EDT.").toJson(); //$NON-NLS-1$ //$NON-NLS-2$
     }
 
     private String getStructureInternal(String projectName, String modulePath,
-        boolean includeVariables, boolean includeComments)
+        boolean includeVariables, boolean includeComments, boolean detailed)
     {
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
 
         Module module = BslModuleUtils.loadModule(project, modulePath);
         if (module == null)
         {
-            return "Error: BSL model is not available for '" + modulePath + "'\n" + //$NON-NLS-1$ //$NON-NLS-2$
-                   "Make sure project '" + projectName + "' is open and fully indexed in EDT."; //$NON-NLS-1$ //$NON-NLS-2$
+            return ToolResult.error("BSL model is not available for '" + modulePath + "'\n" + //$NON-NLS-1$ //$NON-NLS-2$
+                   "Make sure project '" + projectName + "' is open and fully indexed in EDT.").toJson(); //$NON-NLS-1$ //$NON-NLS-2$
         }
 
-        List<RegionInfo> regions = collectRegions(module);
+        // Load the source lines once: needed for accurate region end-line
+        // detection (the AST end line of a RegionPreprocessor is unreliable —
+        // it spans to the end of the module) and, when requested, for
+        // doc-comment extraction.
+        List<String> sourceLines = loadSourceLines(module);
+
+        List<RegionInfo> regions = collectRegions(module, sourceLines);
 
         // Collect methods
-        List<MethodInfo> methods = collectMethods(module, regions, includeComments);
+        List<MethodInfo> methods = collectMethods(module, regions, includeComments, sourceLines);
 
         // Collect variables if requested
         List<VariableInfo> variables = includeVariables ? collectVariables(module, regions) : null;
@@ -215,7 +244,15 @@ public class GetModuleStructureTool implements IMcpTool
             return sb.toString();
         }
 
-        appendMethodsTable(sb, methods);
+        appendMethodsTable(sb, methods, detailed);
+
+        // Extension interception: list every link between this module's methods and
+        // extension interceptors (either direction). Best-effort; omitted when none.
+        String interception = InterceptionUtils.moduleFooter(module);
+        if (interception != null)
+        {
+            sb.append(interception);
+        }
 
         return sb.toString();
     }
@@ -224,10 +261,18 @@ public class GetModuleStructureTool implements IMcpTool
     /**
      * Appends a markdown methods table to the StringBuilder.
      * Shared between EMF and text-based paths to avoid duplication.
+     * <p>
+     * In {@code detailed} mode the table carries the full set of columns
+     * (including the verbose Parameters signature column and, when doc-comments
+     * were collected, a Description column). In concise mode those two verbose
+     * columns are dropped to save output tokens; every other column (type, name,
+     * export, context, lines, region) is kept so the caller can still act and
+     * read a specific method's signature via {@code read_method_source}.
      */
-    private void appendMethodsTable(StringBuilder sb, List<MethodInfo> methods)
+    private void appendMethodsTable(StringBuilder sb, List<MethodInfo> methods, boolean detailed)
     {
-        // Check if any method has doc-comments
+        // Check if any method has doc-comments (only ever populated when
+        // includeComments was requested; in concise mode the column is dropped).
         boolean hasComments = false;
         for (MethodInfo m : methods)
         {
@@ -237,17 +282,26 @@ public class GetModuleStructureTool implements IMcpTool
                 break;
             }
         }
+        boolean showComments = detailed && hasComments;
 
         sb.append("### Methods\n\n"); //$NON-NLS-1$
-        if (hasComments)
+        if (detailed)
         {
-            sb.append("| # | Type | Name | Export | Context | Lines | Parameters | Region | Description |\n"); //$NON-NLS-1$
-            sb.append("|---|------|------|--------|---------|-------|------------|--------|-------------|\n"); //$NON-NLS-1$
+            if (showComments)
+            {
+                sb.append("| # | Type | Name | Export | Context | Lines | Parameters | Region | Description |\n"); //$NON-NLS-1$
+                sb.append("|---|------|------|--------|---------|-------|------------|--------|-------------|\n"); //$NON-NLS-1$
+            }
+            else
+            {
+                sb.append("| # | Type | Name | Export | Context | Lines | Parameters | Region |\n"); //$NON-NLS-1$
+                sb.append("|---|------|------|--------|---------|-------|------------|--------|\n"); //$NON-NLS-1$
+            }
         }
         else
         {
-            sb.append("| # | Type | Name | Export | Context | Lines | Parameters | Region |\n"); //$NON-NLS-1$
-            sb.append("|---|------|------|--------|---------|-------|------------|--------|\n"); //$NON-NLS-1$
+            sb.append("| # | Type | Name | Export | Context | Lines | Region |\n"); //$NON-NLS-1$
+            sb.append("|---|------|------|--------|---------|-------|--------|\n"); //$NON-NLS-1$
         }
 
         int idx = 1;
@@ -259,9 +313,12 @@ public class GetModuleStructureTool implements IMcpTool
             sb.append(" | ").append(m.isExport ? "Yes" : "-"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             sb.append(" | ").append(m.executionContext != null ? MarkdownUtils.escapeForTable(m.executionContext) : "-"); //$NON-NLS-1$ //$NON-NLS-2$
             sb.append(" | ").append(m.startLine).append("-").append(m.endLine); //$NON-NLS-1$ //$NON-NLS-2$
-            sb.append(" | ").append(MarkdownUtils.escapeForTable(m.paramsString)); //$NON-NLS-1$
+            if (detailed)
+            {
+                sb.append(" | ").append(MarkdownUtils.escapeForTable(m.paramsString)); //$NON-NLS-1$
+            }
             sb.append(" | ").append(m.region != null ? MarkdownUtils.escapeForTable(m.region) : "-"); //$NON-NLS-1$ //$NON-NLS-2$
-            if (hasComments)
+            if (showComments)
             {
                 sb.append(" | ").append(m.docComment != null ? MarkdownUtils.escapeForTable(m.docComment) : "-"); //$NON-NLS-1$ //$NON-NLS-2$
             }
@@ -294,9 +351,11 @@ public class GetModuleStructureTool implements IMcpTool
 
 
     /**
-     * Collects regions from the BSL AST model.
+     * Collects regions from the BSL AST model. Region names and start lines come
+     * from the AST (so the name is resolved regardless of ru/en dialect); the
+     * end line is matched in the source (see {@link #computeRegionEndLine}).
      */
-    private List<RegionInfo> collectRegions(Module module)
+    private List<RegionInfo> collectRegions(Module module, List<String> sourceLines)
     {
         List<RegionInfo> regions = new ArrayList<>();
 
@@ -310,7 +369,7 @@ public class GetModuleStructureTool implements IMcpTool
                     RegionInfo info = new RegionInfo();
                     info.name = region.getName();
                     info.startLine = BslModuleUtils.getStartLine(region);
-                    info.endLine = computeRegionEndLine(region, info.startLine);
+                    info.endLine = computeRegionEndLine(sourceLines, info.startLine);
                     if (info.name != null && !info.name.isEmpty() && info.startLine > 0)
                     {
                         regions.add(info);
@@ -326,51 +385,95 @@ public class GetModuleStructureTool implements IMcpTool
         return regions;
     }
 
-    /** Computes region end line by scanning all contained EObjects for the maximum end line. */
-    private int computeRegionEndLine(RegionPreprocessor region, int startLine)
+    /**
+     * Computes a region's end line (the line of its matching {@code #EndRegion} /
+     * {@code #КонецОбласти}) by scanning the source from the region's start line
+     * and tracking nesting depth.
+     * <p>
+     * The AST end line of a {@code RegionPreprocessor} is unreliable — one of its
+     * contained elements resolves (via the node model) to the whole module, so
+     * every region would otherwise report the end of the file. Matching the
+     * markers in the source is exact and handles both sibling and nested regions
+     * and both BSL dialects.
+     *
+     * @param sourceLines all module lines (line N is {@code sourceLines.get(N-1)}),
+     *                    may be {@code null}
+     * @param startLine   the region's 1-based start line (its {@code #Region} marker)
+     * @return the 1-based line of the matching end marker, or {@code startLine} if
+     *         the source is unavailable or no matching marker is found
+     */
+    static int computeRegionEndLine(List<String> sourceLines, int startLine)
     {
-        int endLine = startLine;
-        for (var iter = region.eAllContents(); iter.hasNext();)
+        if (sourceLines == null || startLine < 1 || startLine > sourceLines.size())
         {
-            int childEnd = BslModuleUtils.getEndLine(iter.next());
-            if (childEnd > endLine)
+            return startLine;
+        }
+        int depth = 0;
+        for (int i = startLine - 1; i < sourceLines.size(); i++)
+        {
+            String trimmed = sourceLines.get(i).trim();
+            if (isRegionStart(trimmed))
             {
-                endLine = childEnd;
+                depth++;
+            }
+            else if (isRegionEnd(trimmed))
+            {
+                depth--;
+                if (depth <= 0)
+                {
+                    return i + 1;
+                }
             }
         }
-        return endLine > startLine ? endLine + 1 : startLine + 1; // +1 for #EndRegion line
+        return startLine;
     }
-    private List<MethodInfo> collectMethods(Module module, List<RegionInfo> regions,
-        boolean includeComments)
+
+    /** True if a trimmed line opens a region: {@code #Region} / {@code #Область} (either dialect). */
+    static boolean isRegionStart(String trimmedLine)
     {
-        List<MethodInfo> methods = new ArrayList<>();
-        
-        // Load source lines if includeComments is enabled
-        List<String> sourceLines = null;
-        if (includeComments)
+        String lower = trimmedLine.toLowerCase(Locale.ROOT);
+        return lower.startsWith("#region") //$NON-NLS-1$
+            || lower.startsWith("#\u043E\u0431\u043B\u0430\u0441\u0442\u044C"); // #Область //$NON-NLS-1$
+    }
+
+    /** True if a trimmed line closes a region: {@code #EndRegion} / {@code #КонецОбласти} (either dialect). */
+    static boolean isRegionEnd(String trimmedLine)
+    {
+        String lower = trimmedLine.toLowerCase(Locale.ROOT);
+        return lower.startsWith("#endregion") //$NON-NLS-1$
+            || lower.startsWith("#\u043A\u043E\u043D\u0435\u0446\u043E\u0431\u043B\u0430\u0441\u0442\u0438"); // #КонецОбласти //$NON-NLS-1$
+    }
+
+    /** Loads all source lines of a module's .bsl file, or {@code null} if unavailable. */
+    private List<String> loadSourceLines(Module module)
+    {
+        try
         {
-            try
+            Resource resource = module.eResource();
+            if (resource != null)
             {
-                Resource resource = module.eResource();
-                if (resource != null)
+                URI uri = resource.getURI();
+                if (uri.isPlatformResource())
                 {
-                    URI uri = resource.getURI();
-                    if (uri.isPlatformResource())
+                    String platformString = uri.toPlatformString(true);
+                    IFile file = ResourcesPlugin.getWorkspace().getRoot().getFile(new Path(platformString));
+                    if (file != null && file.exists())
                     {
-                        String platformString = uri.toPlatformString(true);
-                        IFile file = ResourcesPlugin.getWorkspace().getRoot().getFile(new Path(platformString));
-                        if (file != null && file.exists())
-                        {
-                            sourceLines = BslModuleUtils.readFileLines(file);
-                        }
+                        return BslModuleUtils.readFileLines(file);
                     }
                 }
             }
-            catch (Exception e)
-            {
-                Activator.logWarning("Failed to load source for comment extraction: " + e.getMessage()); //$NON-NLS-1$
-            }
         }
+        catch (Exception e)
+        {
+            Activator.logWarning("Failed to load source lines: " + e.getMessage()); //$NON-NLS-1$
+        }
+        return null;
+    }
+    private List<MethodInfo> collectMethods(Module module, List<RegionInfo> regions,
+        boolean includeComments, List<String> sourceLines)
+    {
+        List<MethodInfo> methods = new ArrayList<>();
 
         for (Method method : module.allMethods())
         {
@@ -539,46 +642,10 @@ public class GetModuleStructureTool implements IMcpTool
      */
     private String extractDocCommentFromLines(List<String> sourceLines, int methodStartLine)
     {
-        if (sourceLines == null || methodStartLine <= 1)
-        {
-            return null;
-        }
-        
-        List<String> commentLines = new ArrayList<>();
-        
-        // Scan backwards from line before method (convert to 0-based index)
-        for (int i = methodStartLine - 2; i >= 0; i--)
-        {
-            String line = sourceLines.get(i).trim();
-            
-            if (line.startsWith("//")) //$NON-NLS-1$
-            {
-                // Strip leading // and optional space
-                String commentText = line.substring(2);
-                if (commentText.startsWith(" ")) //$NON-NLS-1$
-                {
-                    commentText = commentText.substring(1);
-                }
-                commentLines.add(0, commentText);
-            }
-            else if (line.isEmpty())
-            {
-                // Skip empty lines between comment and method
-                continue;
-            }
-            else
-            {
-                // Hit non-comment, non-empty line → stop
-                break;
-            }
-        }
-        
-        if (commentLines.isEmpty())
-        {
-            return null;
-        }
-        
-        return String.join(" ", commentLines); //$NON-NLS-1$
+        // Delegate to the shared helper, which uses the ADJACENCY policy:
+        // the doc-comment block must be contiguous and immediately precede the
+        // declaration; a blank line ends the block.
+        return BslModuleUtils.extractDocCommentText(sourceLines, methodStartLine);
     }
 
     /**

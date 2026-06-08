@@ -160,7 +160,8 @@ public class ToolGroupTest
         assertTrue(tools.contains("get_configuration_properties"));
         assertTrue(tools.contains("export_configuration_to_xml"));
         assertTrue(tools.contains("import_configuration_from_xml"));
-        assertEquals(8, tools.size());
+        assertTrue(tools.contains("delete_project"));
+        assertEquals(9, tools.size());
     }
 
     @Test
@@ -188,9 +189,21 @@ public class ToolGroupTest
     {
         List<String> tools = ToolGroup.REFACTORING.getToolNames();
         assertTrue(tools.contains("rename_metadata_object"));
-        assertTrue(tools.contains("delete_metadata_object"));
-        assertTrue(tools.contains("add_metadata_attribute"));
-        assertTrue(tools.contains("create_metadata_object"));
+        assertTrue(tools.contains("delete_metadata"));
+        // create_metadata is the unified FQN-addressed create (folded the former
+        // create_metadata_object + add_metadata_attribute).
+        assertTrue(tools.contains("create_metadata"));
+        assertFalse(tools.contains("create_metadata_object"));
+        assertFalse(tools.contains("add_metadata_attribute"));
+        // The unified property writer belongs here too (it also edits form members by FQN; the former
+        // add_form_*/set_form_item_property/delete_form_item tools were folded into
+        // create/modify/delete_metadata and removed in F4b).
+        assertTrue(tools.contains("modify_metadata"));
+        assertFalse(tools.contains("add_form_attribute"));
+        assertFalse(tools.contains("set_form_item_property"));
+        assertFalse(tools.contains("add_form_command"));
+        assertFalse(tools.contains("delete_form_item"));
+        assertFalse(tools.contains("add_form_item"));
         assertEquals(4, tools.size());
     }
 }

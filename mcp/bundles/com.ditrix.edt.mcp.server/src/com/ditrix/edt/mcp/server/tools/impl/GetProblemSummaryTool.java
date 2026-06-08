@@ -11,8 +11,6 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
 
 import com._1c.g5.v8.dt.validation.marker.IMarkerManager;
 import com._1c.g5.v8.dt.validation.marker.Marker;
@@ -21,8 +19,10 @@ import com._1c.g5.v8.dt.validation.marker.MarkerSeverity;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool to get problem summary (counts by project and severity).
@@ -42,7 +42,8 @@ public class GetProblemSummaryTool implements IMcpTool
     public String getDescription()
     {
         return "Get problem summary with counts grouped by project and EDT severity level " + //$NON-NLS-1$
-               "(ERRORS, BLOCKER, CRITICAL, MAJOR, MINOR, TRIVIAL)."; //$NON-NLS-1$
+               "(ERRORS, BLOCKER, CRITICAL, MAJOR, MINOR, TRIVIAL). " + //$NON-NLS-1$
+               "Use this for severity totals only; for the detailed per-marker list call get_project_errors."; //$NON-NLS-1$
     }
     
     @Override
@@ -52,7 +53,7 @@ public class GetProblemSummaryTool implements IMcpTool
             .stringProperty("projectName", "Name of the project (optional, all projects if not specified)") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
-    
+
     @Override
     public String execute(Map<String, String> params)
     {
@@ -76,18 +77,16 @@ public class GetProblemSummaryTool implements IMcpTool
             
             if (markerManager == null)
             {
-                return "**Error:** IMarkerManager service is not available"; //$NON-NLS-1$
+                return ToolResult.error("IMarkerManager service is not available").toJson(); //$NON-NLS-1$
             }
-            
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
             
             // Validate project if specified
             if (projectName != null && !projectName.isEmpty())
             {
-                IProject project = workspace.getRoot().getProject(projectName);
-                if (project == null || !project.exists())
+                ProjectContext ctx = ProjectContext.of(projectName);
+                if (!ctx.exists())
                 {
-                    return "**Error:** Project not found: " + projectName; //$NON-NLS-1$
+                    return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
                 }
             }
             
@@ -175,7 +174,7 @@ public class GetProblemSummaryTool implements IMcpTool
                 for (Map.Entry<String, Map<MarkerSeverity, Integer>> entry : projectSummaries.entrySet())
                 {
                     Map<MarkerSeverity, Integer> counts = entry.getValue();
-                    int projectTotal = counts.values().stream().mapToInt(Integer::intValue).sum();
+                    int projectTotal = sumDisplayedSeverities(counts);
                     
                     md.append("| "); //$NON-NLS-1$
                     md.append(MarkdownUtils.escapeForTable(entry.getKey()));
@@ -204,9 +203,35 @@ public class GetProblemSummaryTool implements IMcpTool
         catch (Exception e)
         {
             Activator.logError("Error getting problem summary", e); //$NON-NLS-1$
-            return "**Error:** " + e.getMessage(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson(); //$NON-NLS-1$
         }
         
         return md.toString();
+    }
+
+    /**
+     * Sums only the six severities rendered as per-project columns
+     * (ERRORS, BLOCKER, CRITICAL, MAJOR, MINOR, TRIVIAL).
+     *
+     * <p>The per-project Total must equal the sum of the displayed columns, so
+     * {@link MarkerSeverity#NONE} (and any other non-displayed severity) is excluded.
+     * Summing {@code counts.values()} would also count NONE and make Total exceed the
+     * visible columns.</p>
+     *
+     * @param counts severity -&gt; count map for a single project (may omit some keys)
+     * @return the sum across the six displayed severity columns
+     */
+    static int sumDisplayedSeverities(Map<MarkerSeverity, Integer> counts)
+    {
+        if (counts == null)
+        {
+            return 0;
+        }
+        return counts.getOrDefault(MarkerSeverity.ERRORS, 0)
+            + counts.getOrDefault(MarkerSeverity.BLOCKER, 0)
+            + counts.getOrDefault(MarkerSeverity.CRITICAL, 0)
+            + counts.getOrDefault(MarkerSeverity.MAJOR, 0)
+            + counts.getOrDefault(MarkerSeverity.MINOR, 0)
+            + counts.getOrDefault(MarkerSeverity.TRIVIAL, 0);
     }
 }

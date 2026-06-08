@@ -34,10 +34,12 @@ public class DebugYaxunitTestsToolTest
     }
 
     @Test
-    public void testResponseTypeJson()
+    public void testResponseTypeMarkdown()
     {
+        // Deprecated alias now forwards to run_yaxunit_tests(debug=true), which is
+        // a MARKDOWN tool, so the alias inherits the default MARKDOWN response type.
         DebugYaxunitTestsTool tool = new DebugYaxunitTestsTool();
-        assertEquals(IMcpTool.ResponseType.JSON, tool.getResponseType());
+        assertEquals(IMcpTool.ResponseType.MARKDOWN, tool.getResponseType());
     }
 
     @Test
@@ -63,6 +65,20 @@ public class DebugYaxunitTestsToolTest
         assertTrue(schema.contains("\"tests\""));
         assertTrue("schema must include updateBeforeLaunch (auto-chain switch)",
             schema.contains("\"updateBeforeLaunch\""));
+    }
+
+    @Test
+    public void testGuideHoldsMigratedDetail()
+    {
+        IMcpTool tool = new DebugYaxunitTestsTool();
+        String guide = tool.getGuide();
+        assertNotNull(guide);
+        assertTrue("guide should be non-empty", guide.length() > 0);
+        // Detail moved out of description/schema must live in the guide.
+        assertTrue("guide must explain the wait_for_break next step",
+            guide.contains("wait_for_break"));
+        assertTrue("guide must document the updateBeforeLaunch auto-chain",
+            guide.contains("updateBeforeLaunch"));
     }
 
     @Test
@@ -97,5 +113,17 @@ public class DebugYaxunitTestsToolTest
         String result = tool.execute(new HashMap<String, String>());
         assertNotNull(result);
         assertTrue("must indicate error", result.contains("\"error\""));
+    }
+
+    @Test
+    public void testDeprecatedAliasPointsToRunTool()
+    {
+        IMcpTool tool = new DebugYaxunitTestsTool();
+        assertTrue("class must be annotated @Deprecated",
+            tool.getClass().isAnnotationPresent(Deprecated.class));
+        assertTrue("description must steer callers to run_yaxunit_tests",
+            tool.getDescription().contains("run_yaxunit_tests"));
+        assertTrue("guide must document the run_yaxunit_tests(debug=true) replacement",
+            tool.getGuide().contains("debug=true"));
     }
 }

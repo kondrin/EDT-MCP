@@ -27,7 +27,10 @@ public class ImportConfigurationFromXmlToolTest
     @Test
     public void testResponseType()
     {
-        assertEquals(ResponseType.JSON, new ImportConfigurationFromXmlTool().getResponseType());
+        // import_configuration_from_xml is an action tool with no round-trip ID and
+        // no machine-structured payload, so it returns MARKDOWN (see the
+        // "Response format policy" in edt-mcp-tool-conventions).
+        assertEquals(ResponseType.MARKDOWN, new ImportConfigurationFromXmlTool().getResponseType());
     }
 
     @Test
@@ -36,6 +39,21 @@ public class ImportConfigurationFromXmlToolTest
         String desc = new ImportConfigurationFromXmlTool().getDescription();
         assertNotNull(desc);
         assertFalse(desc.isEmpty());
+    }
+
+    @Test
+    public void testGuideHoldsMigratedDetail()
+    {
+        // The exhaustive per-tool detail moved out of the always-loaded
+        // description/schema into the on-demand getGuide() channel.
+        String guide = new ImportConfigurationFromXmlTool().getGuide();
+        assertNotNull(guide);
+        assertFalse("getGuide() must be non-empty", guide.isEmpty()); //$NON-NLS-1$
+        // A keyword that was migrated from the schema's parameter prose.
+        assertTrue("guide must explain auto-detect behaviour", //$NON-NLS-1$
+            guide.contains("auto-detect")); //$NON-NLS-1$
+        assertTrue("guide must document the new-project constraint", //$NON-NLS-1$
+            guide.contains("already exist")); //$NON-NLS-1$
     }
 
     @Test

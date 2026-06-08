@@ -22,7 +22,7 @@ import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 
 /**
- * Retrieves profiling (замер производительности) results after a debug session.
+ * Retrieves profiling results after a debug session.
  * Returns per-module, per-line execution data: call count (frequency), timing,
  * and percentage — effectively a code coverage report.
  *
@@ -48,17 +48,38 @@ public class GetProfilingResultsTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Get profiling (performance measurement) results after a debug session. " //$NON-NLS-1$
-            + "Returns per-module, per-line data: call count, timing, percentage. " //$NON-NLS-1$
-            + "Optionally filter by module name. Call after start_profiling + test run."; //$NON-NLS-1$
+        return "Get profiling (performance measurement) results after a debug session: " //$NON-NLS-1$
+            + "per-module, per-line call count, timing and percentage. Returns only the MOST " //$NON-NLS-1$
+            + "RECENT measurement session (historical sessions are not returned). Also reports " //$NON-NLS-1$
+            + "whether profiling is currently active. Run start_profiling + the test (then stop_profiling) first. " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('get_profiling_results')."; //$NON-NLS-1$
     }
 
     @Override
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("moduleFilter", "Optional substring filter on module name") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("moduleFilter", "Case-insensitive substring filter on module name") //$NON-NLS-1$ //$NON-NLS-2$
             .integerProperty("minFrequency", "Only include lines called at least N times (default: 1)") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("applicationId", //$NON-NLS-1$
+                "Debug session id; when set, reports active state for that session") //$NON-NLS-1$
+            .enumProperty("responseFormat", //$NON-NLS-1$
+                "concise (default) = leaner per-line rows (line, calls, pct only); " //$NON-NLS-1$
+                    + "detailed = full rows incl. code text, method signature and dur/pureDur timing", //$NON-NLS-1$
+                "concise", "detailed") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("count", "Number of result sets returned (0 or 1 — only the latest session)") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("profilingActive", "Whether profiling is currently active") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("message", "Informational note when no results are available") //$NON-NLS-1$ //$NON-NLS-2$
+            .objectArrayProperty("results", //$NON-NLS-1$
+                "Per-result sets: name, totalDurability, moduleCount and modules map of lines") //$NON-NLS-1$
             .build();
     }
 
@@ -73,6 +94,18 @@ public class GetProfilingResultsTool implements IMcpTool
     {
         String moduleFilter = JsonUtils.extractStringArgument(params, "moduleFilter"); //$NON-NLS-1$
         int minFrequency = JsonUtils.extractIntArgument(params, "minFrequency", 1); //$NON-NLS-1$
+        String applicationId = JsonUtils.extractStringArgument(params, "applicationId"); //$NON-NLS-1$
+        // Output verbosity. Default (and any blank/unrecognized value) is concise: only
+        // detailed emits the verbose per-line extras (code text, method signature, dur/pureDur).
+        String responseFormat = JsonUtils.extractStringArgument(params, "responseFormat"); //$NON-NLS-1$
+        boolean detailed = "detailed".equalsIgnoreCase( //$NON-NLS-1$
+            responseFormat == null ? null : responseFormat.trim());
+        // On/off state from the shared profiling state (single source of truth in
+        // StartProfilingTool). When no applicationId is given we surface whether any
+        // session is profiling so a client can still tell that a stop is pending.
+        boolean profilingActive = applicationId != null && !applicationId.isEmpty()
+            ? StartProfilingTool.isProfilingActive(applicationId)
+            : StartProfilingTool.isAnyProfilingActive();
 
         try
         {
@@ -107,6 +140,7 @@ public class GetProfilingResultsTool implements IMcpTool
             {
                 return ToolResult.success()
                     .put("count", 0) //$NON-NLS-1$
+                    .put("profilingActive", profilingActive) //$NON-NLS-1$
                     .put("message", "No profiling results available. " //$NON-NLS-1$ //$NON-NLS-2$
                         + "Make sure you called start_profiling before running the test.") //$NON-NLS-1$
                     .toJson();
@@ -121,6 +155,12 @@ public class GetProfilingResultsTool implements IMcpTool
             Method getProfilingResults = profilingResultClass.getMethod("getProfilingResults"); //$NON-NLS-1$
             Method getTotalDurability = profilingResultClass.getMethod("getTotalDurability"); //$NON-NLS-1$
             Method getResultName = profilingResultClass.getMethod("getName"); //$NON-NLS-1$
+
+            // Contract: return ONLY the latest measurement session — historical sessions are
+            // noise. getResults() is backed by an unordered cache + a store that survives
+            // restarts, so "latest" is the max getDateOfSession() (not list position).
+            Method getDateOfSession = profilingResultClass.getMethod("getDateOfSession"); //$NON-NLS-1$
+            results = latestOnly(results, getDateOfSession);
 
             // ILineProfilingResult methods
             Method getLineNo = lineResultClass.getMethod("getLineNo"); //$NON-NLS-1$
@@ -185,16 +225,22 @@ public class GetProfilingResultsTool implements IMcpTool
                     lineInfo.put("line", getLineNo.invoke(lr)); //$NON-NLS-1$
                     lineInfo.put("calls", freq); //$NON-NLS-1$
                     lineInfo.put("pct", Math.round(((Number) getPercentage.invoke(lr)).doubleValue() * 100.0) / 100.0); //$NON-NLS-1$
-                    lineInfo.put("dur", Math.round(((Number) getDurability.invoke(lr)).doubleValue() * 1000.0) / 1000.0); //$NON-NLS-1$
-                    lineInfo.put("pureDur", Math.round(((Number) getPureDurability.invoke(lr)).doubleValue() * 1000.0) / 1000.0); //$NON-NLS-1$
 
-                    String code = (String) getLine.invoke(lr);
-                    if (code != null && code.length() > 120)
+                    // Verbose per-line extras only in detailed: the secondary timing columns
+                    // and the source text + method signature. concise keeps line/calls/pct.
+                    if (detailed)
                     {
-                        code = code.substring(0, 120) + "..."; //$NON-NLS-1$
+                        lineInfo.put("dur", Math.round(((Number) getDurability.invoke(lr)).doubleValue() * 1000.0) / 1000.0); //$NON-NLS-1$
+                        lineInfo.put("pureDur", Math.round(((Number) getPureDurability.invoke(lr)).doubleValue() * 1000.0) / 1000.0); //$NON-NLS-1$
+
+                        String code = (String) getLine.invoke(lr);
+                        if (code != null && code.length() > 120)
+                        {
+                            code = code.substring(0, 120) + "..."; //$NON-NLS-1$
+                        }
+                        lineInfo.put("code", code); //$NON-NLS-1$
+                        lineInfo.put("method", getMethodSignature.invoke(lr)); //$NON-NLS-1$
                     }
-                    lineInfo.put("code", code); //$NON-NLS-1$
-                    lineInfo.put("method", getMethodSignature.invoke(lr)); //$NON-NLS-1$
 
                     lines.add(lineInfo);
                 }
@@ -206,13 +252,49 @@ public class GetProfilingResultsTool implements IMcpTool
 
             return ToolResult.success()
                 .put("count", resultSummaries.size()) //$NON-NLS-1$
+                .put("profilingActive", profilingActive) //$NON-NLS-1$
                 .put("results", resultSummaries) //$NON-NLS-1$
                 .toJson();
         }
         catch (Exception e)
         {
             Activator.logError("Error in get_profiling_results", e); //$NON-NLS-1$
-            return ToolResult.error("Error: " + e.getMessage()).toJson(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson(); //$NON-NLS-1$
         }
+    }
+
+    /**
+     * Reduces the accumulated profiling results to a singleton list holding ONLY the most
+     * recent measurement session (max {@code getDateOfSession()}). {@code getResults()} is
+     * backed by an unordered cache plus a persistent store, so "latest" must be computed
+     * from the session date, not list order. Historical sessions are intentionally dropped
+     * — only the last measurement is meaningful. Falls back to the last element if no
+     * session dates are present. Caller has already verified {@code results} is non-empty.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static List<?> latestOnly(List<?> results, Method getDateOfSession) throws Exception
+    {
+        Object latest = null;
+        Comparable latestDate = null;
+        for (Object result : results)
+        {
+            Object date = getDateOfSession.invoke(result);
+            if (!(date instanceof Comparable))
+            {
+                continue;
+            }
+            // Strict '>' so on an exact-date tie the first max wins; any tied session is
+            // equally "latest" and count stays 1 either way.
+            if (latestDate == null || ((Comparable) date).compareTo(latestDate) > 0)
+            {
+                latestDate = (Comparable) date;
+                latest = result;
+            }
+        }
+        if (latest == null)
+        {
+            latest = results.get(results.size() - 1);
+        }
+        return List.of(latest);
     }
 }

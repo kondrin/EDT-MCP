@@ -31,13 +31,13 @@ import com.e1c.g5.dt.applications.IApplicationManager;
 
 /**
  * Shared helpers for the "prepare for a fresh launch" sequence used by tools
- * that spawn 1С clients via {@code workingCopy.launch()} (YAXUnit run/debug
+ * that spawn 1C clients via {@code workingCopy.launch()} (YAXUnit run/debug
  * tools, etc.).
  *
  * <p>The sequence is needed because EDT's launch delegate brings up its
  * interactive "Update database before launch?" dialog whenever the
  * configuration has unsynced changes, and that dialog blocks the MCP call
- * indefinitely — especially if a 1С client is already holding the infobase in
+ * indefinitely — especially if a 1C client is already holding the infobase in
  * exclusive use, in which case even pressing OK fails on the lock.
  *
  * <p>By terminating any live launch of the target configuration first and
@@ -232,6 +232,53 @@ public final class LaunchLifecycleUtils
             return false;
         }
         return waitForTerminated(launch, Math.max(1, timeoutSeconds) * 1000L);
+    }
+
+    /**
+     * Resolves the effective application id for a launch: returns {@code applicationId}
+     * unchanged when it is set, otherwise falls back to the project's <b>default</b>
+     * application id.
+     *
+     * <p>Needed because a runtime-client launch configuration can be created WITHOUT
+     * an explicit application binding (its {@code applicationId} attribute is empty).
+     * In that case {@code updateBeforeLaunch} has no target to update, the programmatic
+     * pre-launch update fails "Application not found", and the EDT launch delegate then
+     * pops its interactive "Update infobase before launch?" modal — which blocks the MCP
+     * call. Falling back to the project default (the same application
+     * {@code get_applications} reports as {@code defaultApplicationId}) lets the update
+     * run headlessly so no dialog appears.
+     *
+     * @param project the resolved project (may be {@code null})
+     * @param applicationId the id from the call / launch config (may be {@code null}/empty)
+     * @param appManager the application manager (may be {@code null})
+     * @return the given id when non-empty; else the project's default application id;
+     *         else the original (possibly empty) value when no default exists
+     */
+    public static String resolveDefaultApplicationId(IProject project, String applicationId,
+            IApplicationManager appManager)
+    {
+        if (applicationId != null && !applicationId.isEmpty())
+        {
+            return applicationId;
+        }
+        if (appManager == null || project == null)
+        {
+            return applicationId;
+        }
+        try
+        {
+            // getDefaultApplication may throw ApplicationException; degrade to the
+            // original id (the caller then behaves exactly as before the fallback).
+            return appManager.getDefaultApplication(project)
+                .map(IApplication::getId)
+                .orElse(applicationId);
+        }
+        catch (ApplicationException e)
+        {
+            Activator.logError("Error resolving default application for project " //$NON-NLS-1$
+                + project.getName(), e);
+            return applicationId;
+        }
     }
 
     /**
@@ -447,9 +494,9 @@ public final class LaunchLifecycleUtils
             // synthesises "attach:<name>", which never equals a runtime client's
             // UUID, so the per-applicationId loop above never sweeps them. A
             // lingering Attach (e.g. left over from a previous debug session) can
-            // mask which 1С client really holds the IB and clutter diagnostics,
+            // mask which 1C client really holds the IB and clutter diagnostics,
             // so disconnect it before the new spawn. Killing an Attach launch is
-            // just a debugger disconnect — the 1С server keeps running, no
+            // just a debugger disconnect — the 1C server keeps running, no
             // unsaved state is at risk.
             for (ILaunch live : LaunchConfigUtils.getAllLiveLaunches(launchManager,
                 project.getName()))
@@ -480,7 +527,7 @@ public final class LaunchLifecycleUtils
                 {
                     // An Attach disconnect that doesn't complete is unusual but
                     // not fatal to the test run: Attach launches don't hold the
-                    // IB lock (the foreign 1С client does), so a stuck disconnect
+                    // IB lock (the foreign 1C client does), so a stuck disconnect
                     // shouldn't block the new spawn. Log and continue.
                     Activator.logError("Could not disconnect stale Attach launch '" //$NON-NLS-1$
                         + name + "' within " + terminateTimeoutSeconds //$NON-NLS-1$

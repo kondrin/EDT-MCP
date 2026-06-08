@@ -6,16 +6,17 @@
 
 package com.ditrix.edt.mcp.server.tools.impl;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
-import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.NullProgressMonitor;
-import org.eclipse.core.runtime.Path;
 import org.eclipse.jface.text.BadLocationException;
 import org.eclipse.jface.text.IDocument;
 import org.eclipse.jface.text.contentassist.ContentAssistant;
@@ -29,8 +30,10 @@ import org.eclipse.ui.IWorkbenchPage;
 import org.eclipse.ui.IWorkbenchWindow;
 import org.eclipse.ui.PlatformUI;
 import org.eclipse.ui.ide.IDE;
+import org.eclipse.xtext.resource.XtextResource;
 import org.eclipse.xtext.ui.editor.XtextEditor;
 import org.eclipse.xtext.ui.editor.XtextSourceViewer;
+import org.eclipse.xtext.ui.editor.model.IXtextDocument;
 
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.preferences.ToolParameterSettings;
@@ -38,8 +41,9 @@ import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
+import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
+import com.ditrix.edt.mcp.server.utils.Pagination;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 import io.github.furstenheim.CopyDown;
 
@@ -50,7 +54,46 @@ import io.github.furstenheim.CopyDown;
 public class GetContentAssistTool implements IMcpTool
 {
     public static final String NAME = "get_content_assist"; //$NON-NLS-1$
-    
+
+    /**
+     * Maximum total time (ms) to wait for the Xtext editor/resource to become ready before
+     * computing content assist. Bounded so the call can never block forever; on timeout the
+     * tool returns a ToolResult.error so the caller can retry instead of seeing an empty success.
+     */
+    private static final long READINESS_TIMEOUT_MS = 1500L;
+
+    /**
+     * Delay (ms) between readiness polls. The UI event loop is pumped between polls so the
+     * Xtext reconciler (which loads/parses the resource) can make progress.
+     */
+    private static final long READINESS_POLL_DELAY_MS = 50L;
+
+    /**
+     * Maximum total time (ms) to spend stabilizing the proposal set. Even after the resource
+     * has parsed, the BSL global scope/index can still be warming, so the content-assist
+     * processor may return an empty or growing set on the first compute(s). We re-poll until the
+     * count stops growing, bounded by this cap (then accept whatever we have).
+     */
+    private static final long PROPOSAL_STABILIZE_TIMEOUT_MS = 2500L;
+
+    /** Delay (ms) between proposal-stabilization re-computes; the UI loop is pumped between them. */
+    private static final long PROPOSAL_STABILIZE_POLL_MS = 75L;
+
+    /** Shared empty result for the stabilization loop (null/exception compute -> "not ready yet"). */
+    private static final ICompletionProposal[] EMPTY_PROPOSALS = new ICompletionProposal[0];
+
+    /**
+     * Deterministic proposal ordering. The engine can return proposals in a warm-up-dependent
+     * order, so a caller paginating with {@code offset} would otherwise see different items per
+     * call. Order by display string (case-insensitive, then case-sensitive as a stable tie-break)
+     * so {@code offset}/{@code limit} page reproducibly. Null display strings sort last.
+     */
+    private static final Comparator<ICompletionProposal> PROPOSAL_ORDER =
+        Comparator.comparing(GetContentAssistTool::displayStringOf,
+            Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER))
+            .thenComparing(GetContentAssistTool::displayStringOf,
+                Comparator.nullsLast(Comparator.<String>naturalOrder()));
+
     @Override
     public String getName()
     {
@@ -60,25 +103,44 @@ public class GetContentAssistTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Get content assist (code completion) proposals at a specific position in a BSL file. " + //$NON-NLS-1$
-               "Opens the file in EDT editor and retrieves available completions at the given line and column."; //$NON-NLS-1$
+        return "Get code-completion proposals at a 1-based line/column in a BSL module - the members, " //$NON-NLS-1$
+             + "globals and variables valid at that caret (e.g. after a '.'). May return a 'not ready' " //$NON-NLS-1$
+             + "error while the editor loads; just retry. " //$NON-NLS-1$
+             + "Full parameters and examples: call get_tool_guide('get_content_assist')."; //$NON-NLS-1$
     }
-    
+
     @Override
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", "EDT project name (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("filePath", "Path to BSL file relative to project's src folder (e.g. 'CommonModules/MyModule/Module.bsl')", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("projectName", "EDT project name", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("modulePath", "BSL module path under src (e.g. 'CommonModules/MyModule/Module.bsl'); alias: filePath") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("filePath", "Deprecated alias for modulePath") //$NON-NLS-1$ //$NON-NLS-2$
             .integerProperty("line", "Line number (1-based)", true) //$NON-NLS-1$ //$NON-NLS-2$
             .integerProperty("column", "Column number (1-based)", true) //$NON-NLS-1$ //$NON-NLS-2$
-            .integerProperty("limit", "Maximum number of proposals to return (default: from preferences)") //$NON-NLS-1$ //$NON-NLS-2$
-            .integerProperty("offset", "Skip first N proposals (default: 0, for pagination)") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("contains", "Filter proposals by display string containing these substrings (comma-separated, e.g. 'Insert,Add')") //$NON-NLS-1$ //$NON-NLS-2$
-            .booleanProperty("extendedDocumentation", "Return full documentation (default: false, only display string)") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("limit", "Max proposals to return (default: from preferences, max 1000)") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("offset", "Skip first N matching proposals for pagination (default: 0)") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("contains", "Keep proposals whose display string contains any of these substrings (comma-separated, e.g. 'Insert,Add')") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("extendedDocumentation", "Include full documentation per proposal (default: false)") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
-    
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("file", "Workspace-relative path of the module the proposals are for") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("line", "1-based line where proposals were computed") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("column", "1-based column where proposals were computed") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("totalProposals", "Total proposals offered before any filter") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("filteredOut", "Proposals removed by the contains filter") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("skipped", "Proposals consumed by the offset") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("returnedProposals", "Count of proposals returned in this page") //$NON-NLS-1$ //$NON-NLS-2$
+            .objectArrayProperty("proposals", "Proposals as { displayString[, documentation] }") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
     @Override
     public ResponseType getResponseType()
     {
@@ -89,23 +151,27 @@ public class GetContentAssistTool implements IMcpTool
     public String execute(Map<String, String> params)
     {
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
-        String filePath = JsonUtils.extractStringArgument(params, "filePath"); //$NON-NLS-1$
+        // Canonical modulePath; accept the deprecated filePath alias for back-compat.
+        String filePath = JsonUtils.extractStringArgument(params, "modulePath"); //$NON-NLS-1$
+        if (filePath == null || filePath.isEmpty())
+        {
+            filePath = JsonUtils.extractStringArgument(params, "filePath"); //$NON-NLS-1$
+        }
         String lineStr = JsonUtils.extractStringArgument(params, "line"); //$NON-NLS-1$
         String columnStr = JsonUtils.extractStringArgument(params, "column"); //$NON-NLS-1$
-        String offsetStr = JsonUtils.extractStringArgument(params, "offset"); //$NON-NLS-1$
         String containsFilter = JsonUtils.extractStringArgument(params, "contains"); //$NON-NLS-1$
         String extendedDocStr = JsonUtils.extractStringArgument(params, "extendedDocumentation"); //$NON-NLS-1$
         
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return ToolResult.error("projectName is required").toJson(); //$NON-NLS-1$
+            return err;
         }
-        
         if (filePath == null || filePath.isEmpty())
         {
-            return ToolResult.error("filePath is required").toJson(); //$NON-NLS-1$
+            return ToolResult.error("modulePath is required (or the deprecated alias filePath)").toJson(); //$NON-NLS-1$
         }
-        
+
         int line;
         int column;
         try
@@ -127,20 +193,13 @@ public class GetContentAssistTool implements IMcpTool
         int defaultLimit = ToolParameterSettings.getInstance()
             .getParameterValue(NAME, "limit", 100); //$NON-NLS-1$
         int limit = JsonUtils.extractIntArgument(params, "limit", defaultLimit); //$NON-NLS-1$
-        limit = Math.min(Math.max(1, limit), 1000);
-        
-        int offset = 0;
-        if (offsetStr != null && !offsetStr.isEmpty())
-        {
-            try
-            {
-                offset = Math.max(0, (int) Double.parseDouble(offsetStr));
-            }
-            catch (NumberFormatException e)
-            {
-                // Use default 0
-            }
-        }
+        limit = Pagination.clampLimit(limit, 1000);
+
+        // Read offset the SAME way as limit (declare-and-read consistency, CLAUDE.md don't #6):
+        // the schema declares offset as integer, so parse it via extractIntArgument (accepts
+        // "5"/"5.0", rejects "5.7"/"abc" -> 0) rather than the old extractStringArgument +
+        // (int) Double.parseDouble path, which silently truncated "5.7" to 5 while limit rejected it.
+        int offset = Math.max(0, JsonUtils.extractIntArgument(params, "offset", 0)); //$NON-NLS-1$
         
         boolean extendedDocumentation = "true".equalsIgnoreCase(extendedDocStr); //$NON-NLS-1$
         
@@ -165,26 +224,26 @@ public class GetContentAssistTool implements IMcpTool
                                     int limit, int offset, String containsFilter, boolean extendedDocumentation)
     {
         // Find the project
-        IWorkspace workspace = ResourcesPlugin.getWorkspace();
-        IProject project = workspace.getRoot().getProject(projectName);
-        
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+
+        if (!ctx.exists())
         {
-            return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
-        
-        if (!project.isOpen())
+
+        if (!ctx.isOpen())
         {
             return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
         }
+
+        IProject project = ctx.project();
         
         // Build the full path: project/src/filePath
-        IPath relativePath = new Path("src").append(filePath); //$NON-NLS-1$
-        IFile file = project.getFile(relativePath);
-        
+        IFile file = BslModuleUtils.resolveModuleFile(project, filePath);
+
         if (!file.exists())
         {
-            return ToolResult.error("File not found: " + relativePath.toString() + " in project " + projectName).toJson(); //$NON-NLS-1$ //$NON-NLS-2$
+            return ToolResult.error("File not found: " + file.getProjectRelativePath().toString() + " in project " + projectName).toJson(); //$NON-NLS-1$ //$NON-NLS-2$
         }
         
         final IFile targetFile = file;
@@ -209,7 +268,7 @@ public class GetContentAssistTool implements IMcpTool
             catch (Exception e)
             {
                 Activator.logError("Error getting content assist", e); //$NON-NLS-1$
-                resultRef.set(ToolResult.error("Error: " + e.getMessage()).toJson()); //$NON-NLS-1$
+                resultRef.set(ToolResult.error(e.getMessage()).toJson()); //$NON-NLS-1$
             }
         });
         
@@ -289,7 +348,18 @@ public class GetContentAssistTool implements IMcpTool
         }
         
         XtextSourceViewer xtextSourceViewer = (XtextSourceViewer) sourceViewer;
-        
+
+        // DEFENSIVE readiness guard: on a rapid/cold call the editor's Xtext resource may not yet be
+        // parsed/linked (the reconciler runs asynchronously), and content assist would then return an
+        // empty proposal list. Wait briefly (bounded) for the resource to load+parse before computing.
+        // If it never becomes ready, return an error so the caller retries instead of getting an empty
+        // success that looks like "no proposals".
+        if (!waitForResourceReadiness(xtextSourceViewer))
+        {
+            return ToolResult.error(
+                "Xtext editor not ready for content assist (resource still loading). Please retry.").toJson(); //$NON-NLS-1$
+        }
+
         // Get content assist processor
         // We need to get it from the content assistant that's configured in the viewer
         ContentAssistant contentAssistant = (ContentAssistant) xtextSourceViewer.getContentAssistant();
@@ -316,13 +386,188 @@ public class GetContentAssistTool implements IMcpTool
             return ToolResult.error("No content assist processor for content type: " + contentType).toJson(); //$NON-NLS-1$
         }
         
-        ICompletionProposal[] proposals = processor.computeCompletionProposals(sourceViewer, offset);
-        
+        ICompletionProposal[] proposals = computeStableProposals(processor, sourceViewer, offset);
+
         // Format results
         return formatProposals(proposals, maxProposals, proposalOffset, containsFilter, extendedDocumentation,
                                line, column, file.getFullPath().toString());
     }
-    
+
+    /**
+     * Computes the content-assist proposals, stabilizing the set against the global-scope/index
+     * warm-up race. Even after the resource has parsed, the Xtext processor can return an empty or
+     * partial proposal list on the first compute(s) while the BSL scope is still warming, which made
+     * {@code totalProposals}/{@code skipped} non-deterministic across calls (a position with
+     * proposals would intermittently report 0). We re-compute (pumping the UI loop between tries),
+     * keep the LARGEST set seen, and stop once the count is non-empty and no longer growing, bounded
+     * by {@link #PROPOSAL_STABILIZE_TIMEOUT_MS}. A genuinely empty position keeps returning empty and
+     * is accepted when the bound elapses.
+     *
+     * @param processor the content-assist processor for the content type at the offset
+     * @param viewer the source viewer
+     * @param offset the document offset to complete at
+     * @return the stabilized proposal array (never null; empty only if the position truly has none)
+     */
+    private ICompletionProposal[] computeStableProposals(IContentAssistProcessor processor,
+        ISourceViewer viewer, int offset)
+    {
+        long deadline = System.currentTimeMillis() + PROPOSAL_STABILIZE_TIMEOUT_MS;
+        ICompletionProposal[] best = safeCompute(processor, viewer, offset);
+        while (System.currentTimeMillis() < deadline)
+        {
+            int bestCount = best.length;
+            pumpUi(viewer);
+            sleepQuietly(PROPOSAL_STABILIZE_POLL_MS);
+            ICompletionProposal[] next = safeCompute(processor, viewer, offset);
+            if (next.length > bestCount)
+            {
+                best = next; // still warming - more proposals appeared; keep the larger set and retry
+                continue;
+            }
+            if (bestCount > 0)
+            {
+                break; // non-empty and no longer growing -> warmed and stable
+            }
+            // still empty -> keep polling until the bound, then accept the (genuinely-empty) result
+        }
+        return best;
+    }
+
+    /**
+     * Computes proposals once, never returning null and never throwing - a null result or an
+     * exception becomes an empty array so the stabilization loop treats it as "not ready yet".
+     */
+    private static ICompletionProposal[] safeCompute(IContentAssistProcessor processor,
+        ISourceViewer viewer, int offset)
+    {
+        try
+        {
+            ICompletionProposal[] proposals = processor.computeCompletionProposals(viewer, offset);
+            return proposals != null ? proposals : EMPTY_PROPOSALS;
+        }
+        catch (Exception e)
+        {
+            Activator.logError("Error computing content-assist proposals", e); //$NON-NLS-1$
+            return EMPTY_PROPOSALS;
+        }
+    }
+
+    /** Drains queued UI events so the asynchronous Xtext scope/index build can make progress. */
+    private static void pumpUi(ISourceViewer viewer)
+    {
+        Display display = viewer.getTextWidget() != null ? viewer.getTextWidget().getDisplay()
+            : Display.getCurrent();
+        if (display != null)
+        {
+            while (display.readAndDispatch())
+            {
+                // drain queued events
+            }
+        }
+    }
+
+    /** Sleeps without propagating interruption as a checked exception (restores the interrupt flag). */
+    private static void sleepQuietly(long millis)
+    {
+        try
+        {
+            Thread.sleep(millis);
+        }
+        catch (InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Display-string accessor for {@link #PROPOSAL_ORDER}; may be null (the comparator sorts those last). */
+    private static String displayStringOf(ICompletionProposal proposal)
+    {
+        return proposal == null ? null : proposal.getDisplayString();
+    }
+
+    /**
+     * Bounded, best-effort wait for the editor's Xtext resource to be loaded and parsed so content
+     * assist can produce proposals. Runs on the UI thread (the caller is inside Display.syncExec):
+     * polls readiness, pumping the UI event loop between polls so the asynchronous reconciler can
+     * make progress. Never blocks forever - capped by {@link #READINESS_TIMEOUT_MS}.
+     *
+     * @param viewer the Xtext source viewer of the open editor
+     * @return true if the resource became ready within the timeout, false otherwise
+     */
+    private boolean waitForResourceReadiness(XtextSourceViewer viewer)
+    {
+        IXtextDocument document = viewer.getXtextDocument();
+        if (document == null)
+        {
+            // No Xtext document available; let the caller proceed and surface any downstream error.
+            return true;
+        }
+
+        Display display = viewer.getTextWidget() != null ? viewer.getTextWidget().getDisplay() : Display.getCurrent();
+        long deadline = System.currentTimeMillis() + READINESS_TIMEOUT_MS;
+
+        while (true)
+        {
+            if (isResourceReady(document))
+            {
+                return true;
+            }
+
+            if (System.currentTimeMillis() >= deadline)
+            {
+                return false;
+            }
+
+            // Pump pending UI events so the reconciler/loader can advance, then sleep briefly.
+            if (display != null)
+            {
+                while (display.readAndDispatch())
+                {
+                    // drain queued events
+                }
+            }
+
+            try
+            {
+                Thread.sleep(READINESS_POLL_DELAY_MS);
+            }
+            catch (InterruptedException e)
+            {
+                Thread.currentThread().interrupt();
+                // Stop waiting; let the readiness check decide the final answer.
+                return isResourceReady(document);
+            }
+        }
+    }
+
+    /**
+     * Checks whether the Xtext resource backing the document is loaded and has parsed content.
+     * Uses a non-blocking read access: if the resource is not yet available (state null or read
+     * lock not grantable) the default {@code false} is returned, which is treated as "not ready".
+     *
+     * @param document the Xtext document of the open editor
+     * @return true if the resource is loaded and has at least one root element
+     */
+    private boolean isResourceReady(IXtextDocument document)
+    {
+        try
+        {
+            Boolean ready = document.tryReadOnly((XtextResource resource) -> {
+                if (resource == null || !resource.isLoaded())
+                {
+                    return Boolean.FALSE;
+                }
+                return Boolean.valueOf(!resource.getContents().isEmpty());
+            }, () -> Boolean.FALSE);
+            return Boolean.TRUE.equals(ready);
+        }
+        catch (Exception e)
+        {
+            // Treat any read failure as "not ready yet" so we keep polling within the bound.
+            return false;
+        }
+    }
+
     /**
      * Formats completion proposals as JSON.
      * 
@@ -336,16 +581,18 @@ public class GetContentAssistTool implements IMcpTool
      * @param filePath file path for result
      * @return JSON string
      */
-    private String formatProposals(ICompletionProposal[] proposals, int maxProposals, int proposalOffset,
+    static String formatProposals(ICompletionProposal[] proposals, int maxProposals, int proposalOffset,
                                    String containsFilter, boolean extendedDocumentation,
                                    int line, int column, String filePath)
     {
-        JsonObject result = new JsonObject();
-        result.addProperty("success", true); //$NON-NLS-1$
-        result.addProperty("file", filePath); //$NON-NLS-1$
-        result.addProperty("line", line); //$NON-NLS-1$
-        result.addProperty("column", column); //$NON-NLS-1$
-        
+        // Deterministic page order (see PROPOSAL_ORDER): sort BEFORE applying offset/limit so a
+        // caller paginating with offset sees the same items per call, independent of the engine's
+        // warm-up-dependent return order. totalProposals (= proposals.length) is unaffected.
+        if (proposals != null)
+        {
+            Arrays.sort(proposals, PROPOSAL_ORDER);
+        }
+
         // Parse contains filter into lowercase parts
         String[] filterParts = null;
         if (containsFilter != null && !containsFilter.isEmpty())
@@ -356,18 +603,18 @@ public class GetContentAssistTool implements IMcpTool
                 filterParts[i] = filterParts[i].trim();
             }
         }
-        
-        JsonArray proposalsArray = new JsonArray();
+
+        List<Map<String, Object>> proposalList = new ArrayList<>();
         int count = 0;
         int skipped = 0;
         int filteredOut = 0;
-        
+
         if (proposals != null)
         {
             for (ICompletionProposal proposal : proposals)
             {
                 String displayString = proposal.getDisplayString();
-                
+
                 // Apply contains filter
                 if (filterParts != null)
                 {
@@ -387,23 +634,24 @@ public class GetContentAssistTool implements IMcpTool
                         continue;
                     }
                 }
-                
+
                 // Apply offset (skip first N matching proposals)
                 if (skipped < proposalOffset)
                 {
                     skipped++;
                     continue;
                 }
-                
+
                 // Check limit
                 if (count >= maxProposals)
                 {
                     break;
                 }
-                
-                JsonObject proposalObj = new JsonObject();
-                proposalObj.addProperty("displayString", displayString); //$NON-NLS-1$
-                
+
+                // LinkedHashMap to keep a stable, readable field order per proposal.
+                Map<String, Object> proposalObj = new LinkedHashMap<>();
+                proposalObj.put("displayString", displayString); //$NON-NLS-1$
+
                 // Only get documentation if extendedDocumentation is true
                 if (extendedDocumentation)
                 {
@@ -424,31 +672,34 @@ public class GetContentAssistTool implements IMcpTool
                     {
                         additionalInfo = proposal.getAdditionalProposalInfo();
                     }
-                    
+
                     if (additionalInfo != null && !additionalInfo.isEmpty())
                     {
                         // Strip HTML tags and CSS styles for cleaner output
                         String cleanInfo = cleanHtmlContent(additionalInfo);
                         if (!cleanInfo.isEmpty())
                         {
-                            proposalObj.addProperty("documentation", cleanInfo); //$NON-NLS-1$
+                            proposalObj.put("documentation", cleanInfo); //$NON-NLS-1$
                         }
                     }
                 }
-                
-                proposalsArray.add(proposalObj);
+
+                proposalList.add(proposalObj);
                 count++;
             }
         }
-        
+
         int totalProposals = proposals != null ? proposals.length : 0;
-        result.addProperty("totalProposals", totalProposals); //$NON-NLS-1$
-        result.addProperty("filteredOut", filteredOut); //$NON-NLS-1$
-        result.addProperty("skipped", skipped); //$NON-NLS-1$
-        result.addProperty("returnedProposals", count); //$NON-NLS-1$
-        result.add("proposals", proposalsArray); //$NON-NLS-1$
-        
-        return result.toString();
+        return ToolResult.success()
+            .put("file", filePath) //$NON-NLS-1$
+            .put("line", line) //$NON-NLS-1$
+            .put("column", column) //$NON-NLS-1$
+            .put("totalProposals", totalProposals) //$NON-NLS-1$
+            .put("filteredOut", filteredOut) //$NON-NLS-1$
+            .put("skipped", skipped) //$NON-NLS-1$
+            .put("returnedProposals", count) //$NON-NLS-1$
+            .put("proposals", proposalList) //$NON-NLS-1$
+            .toJson();
     }
     
     /**
@@ -457,7 +708,7 @@ public class GetContentAssistTool implements IMcpTool
      * @param html the HTML content
      * @return cleaned text in Markdown format
      */
-    private String cleanHtmlContent(String html)
+    private static String cleanHtmlContent(String html)
     {
         if (html == null || html.isEmpty())
         {

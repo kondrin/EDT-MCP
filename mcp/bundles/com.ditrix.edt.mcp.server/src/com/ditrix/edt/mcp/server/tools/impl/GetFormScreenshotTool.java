@@ -36,8 +36,10 @@ public class GetFormScreenshotTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Capture a screenshot of the active form WYSIWYG editor as PNG. " + //$NON-NLS-1$
-            "Can open and activate a form automatically by metadata FQN path."; //$NON-NLS-1$
+        return "Capture a PNG screenshot of a form's WYSIWYG editor; pass formPath to open the form " + //$NON-NLS-1$
+            "automatically or omit it to shoot the active editor. Requires EDT launched with " + //$NON-NLS-1$
+            "-DnativeFormBufferedLayoutRender=true, else the image is blank (missing flag, not a bad " + //$NON-NLS-1$
+            "call). Full parameters and examples: call get_tool_guide('get_form_screenshot')."; //$NON-NLS-1$
     }
 
     @Override
@@ -47,10 +49,8 @@ public class GetFormScreenshotTool implements IMcpTool
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name. Required when formPath is specified.") //$NON-NLS-1$
             .stringProperty("formPath", //$NON-NLS-1$
-                "Metadata FQN path to the form. " + //$NON-NLS-1$
-                "Format: 'MetadataType.ObjectName.Forms.FormName' or 'CommonForm.FormName'. " + //$NON-NLS-1$
-                "Examples: 'Catalog.Products.Forms.ItemForm', 'Document.SalesOrder.Forms.DocumentForm', " + //$NON-NLS-1$
-                "'CommonForm.MyForm'. If not specified, captures the currently active form editor.") //$NON-NLS-1$
+                "Form FQN (e.g. 'Catalog.Products.Forms.ItemForm' or 'CommonForm.MyForm'); " + //$NON-NLS-1$
+                "if omitted, captures the active form editor.") //$NON-NLS-1$
             .booleanProperty("refresh", "Force WYSIWYG refresh before capture (default: false)") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }

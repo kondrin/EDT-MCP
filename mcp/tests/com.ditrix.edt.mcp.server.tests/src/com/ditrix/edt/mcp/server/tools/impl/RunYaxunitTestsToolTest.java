@@ -50,6 +50,19 @@ public class RunYaxunitTestsToolTest
     }
 
     @Test
+    public void testGuideHasMigratedDetail()
+    {
+        IMcpTool tool = new RunYaxunitTestsTool();
+        String guide = tool.getGuide();
+        assertNotNull(guide);
+        assertTrue("guide must be non-empty", guide.length() > 0);
+        // Detail migrated out of the slim description/schema lives here now.
+        assertTrue("guide must explain Pending/polling", guide.contains("Pending"));
+        assertTrue("guide must explain updateBeforeLaunch auto-chain",
+                guide.contains("updateBeforeLaunch"));
+    }
+
+    @Test
     public void testSchemaContainsRequiredFields()
     {
         IMcpTool tool = new RunYaxunitTestsTool();
@@ -98,6 +111,25 @@ public class RunYaxunitTestsToolTest
         IMcpTool tool = new RunYaxunitTestsTool();
         String result = tool.execute(new HashMap<String, String>());
         assertNotNull(result);
-        assertTrue(result.contains("Error"));
+        // Genuine missing-arg failures now travel as the structured ToolResult.error
+        // JSON contract ({"success":false,"error":"..."}) rather than a markdown body.
+        assertTrue(result.contains("\"success\":false"));
+        assertTrue(result.toLowerCase().contains("required"));
+    }
+
+    @Test
+    public void testSchemaDeclaresDebugFlag()
+    {
+        // The merged tool gained a debug flag (debug_yaxunit_tests is now an alias).
+        IMcpTool tool = new RunYaxunitTestsTool();
+        assertTrue("schema must declare the debug flag", tool.getInputSchema().contains("\"debug\""));
+    }
+
+    @Test
+    public void testGuideExplainsDebugMode()
+    {
+        String guide = new RunYaxunitTestsTool().getGuide();
+        assertTrue("guide must explain debug mode and the wait_for_break next step",
+            guide.contains("debug=true") && guide.contains("wait_for_break"));
     }
 }

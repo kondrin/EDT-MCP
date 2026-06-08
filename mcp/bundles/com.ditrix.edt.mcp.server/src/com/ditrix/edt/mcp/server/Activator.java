@@ -6,11 +6,8 @@
 
 package com.ditrix.edt.mcp.server;
 
-import org.eclipse.core.runtime.IStatus;
-import org.eclipse.core.runtime.Status;
 import org.eclipse.ui.plugin.AbstractUIPlugin;
 import org.osgi.framework.BundleContext;
-import org.osgi.util.tracker.ServiceTracker;
 
 import com._1c.g5.v8.dt.bm.xtext.BmAwareResourceSetProvider;
 import com._1c.g5.v8.dt.core.model.IModelObjectFactory;
@@ -20,15 +17,14 @@ import com._1c.g5.v8.dt.core.platform.IDerivedDataManagerProvider;
 import com._1c.g5.v8.dt.core.platform.IDtProjectManager;
 import com._1c.g5.v8.dt.core.platform.IV8ProjectManager;
 import com._1c.g5.v8.dt.lifecycle.IServicesOrchestrator;
-import com._1c.g5.v8.dt.md.MdPlugin;
 import com._1c.g5.v8.dt.md.refactoring.core.IMdRefactoringService;
 import com._1c.g5.v8.dt.navigator.providers.INavigatorContentProviderStateProvider;
 import com._1c.g5.v8.dt.validation.marker.IMarkerManager;
 import com.ditrix.edt.mcp.server.groups.IGroupService;
+import com.ditrix.edt.mcp.server.utils.Log;
 import com.e1c.g5.dt.applications.IApplicationManager;
 import com.e1c.g5.v8.dt.check.ICheckScheduler;
 import com.e1c.g5.v8.dt.check.settings.ICheckRepository;
-import com.google.inject.Injector;
 
 /**
  * EDT MCP Server plugin activator.
@@ -45,43 +41,18 @@ public class Activator extends AbstractUIPlugin
     /** MCP Server instance */
     private McpServer mcpServer;
 
-    /** Service trackers */
-    private ServiceTracker<IV8ProjectManager, IV8ProjectManager> v8ProjectManagerTracker;
-    private ServiceTracker<IDtProjectManager, IDtProjectManager> dtProjectManagerTracker;
-    private ServiceTracker<IConfigurationProvider, IConfigurationProvider> configurationProviderTracker;
-    private ServiceTracker<IMarkerManager, IMarkerManager> markerManagerTracker;
-    private ServiceTracker<ICheckScheduler, ICheckScheduler> checkSchedulerTracker;
-    private ServiceTracker<ICheckRepository, ICheckRepository> checkRepositoryTracker;
-    private ServiceTracker<IBmModelManager, IBmModelManager> bmModelManagerTracker;
-    private ServiceTracker<IDerivedDataManagerProvider, IDerivedDataManagerProvider> derivedDataManagerProviderTracker;
-    private ServiceTracker<IServicesOrchestrator, IServicesOrchestrator> servicesOrchestratorTracker;
-    private ServiceTracker<BmAwareResourceSetProvider, BmAwareResourceSetProvider> resourceSetProviderTracker;
-    private ServiceTracker<IApplicationManager, IApplicationManager> applicationManagerTracker;
-    private ServiceTracker<INavigatorContentProviderStateProvider, INavigatorContentProviderStateProvider> navigatorStateProviderTracker;
-    private ServiceTracker<IMdRefactoringService, IMdRefactoringService> mdRefactoringServiceTracker;
     /**
-     * EDT workspace CLI APIs are tracked by String class name and invoked via
-     * reflection from the tools, keeping this bundle build-independent of
-     * com._1c.g5.v8.dt.cli.api.
+     * EDT platform service access (OSGi service trackers + their getters).
+     * The activator delegates each {@code getXxx} convenience method to this.
      */
-    private ServiceTracker<Object, Object> exportConfigurationFilesApiTracker;
-    private ServiceTracker<Object, Object> importConfigurationFilesApiTracker;
+    private final EdtServices services = new EdtServices();
 
     /**
-     * LanguageTool CLI APIs are tracked by String class name to keep this
-     * bundle build-independent of the com.e1c.langtool.* bundles (LanguageTool
-     * is installed separately via Help -&gt; Install New Software on both EDT
-     * 2025.x and 2026.1; not bundled with the EDT base distribution). All
-     * invocations on the returned services go through reflection — see
-     * GenerateTranslationStringsTool, TranslateConfigurationTool, and
-     * GetTranslationProjectInfoTool.
+     * Startup/shutdown orchestration (group service, tag filter, navigator
+     * toolbar, update checker scheduler). Owns the group service reference;
+     * the activator delegates {@link #getGroupService()} to it.
      */
-    private ServiceTracker<Object, Object> generateTranslationStringsApiTracker;
-    private ServiceTracker<Object, Object> synchronizeProjectApiTracker;
-    private ServiceTracker<Object, Object> projectInformationApiTracker;
-
-    /** Group service instance (created directly, not via OSGi DS to avoid circular references) */
-    private IGroupService groupService;
+    private final StartupOrchestrator orchestrator = new StartupOrchestrator();
 
     @Override
     public void start(BundleContext context) throws Exception
@@ -101,87 +72,14 @@ public class Activator extends AbstractUIPlugin
         // Register tools eagerly so descriptions are available in the preferences UI
         // even if the MCP server has not been started yet.
         mcpServer.registerTools();
-        
+
         // Initialize service trackers
-        v8ProjectManagerTracker = new ServiceTracker<>(context, IV8ProjectManager.class, null);
-        v8ProjectManagerTracker.open();
-        
-        dtProjectManagerTracker = new ServiceTracker<>(context, IDtProjectManager.class, null);
-        dtProjectManagerTracker.open();
-        
-        configurationProviderTracker = new ServiceTracker<>(context, IConfigurationProvider.class, null);
-        configurationProviderTracker.open();
-        
-        markerManagerTracker = new ServiceTracker<>(context, IMarkerManager.class, null);
-        markerManagerTracker.open();
-        
-        checkSchedulerTracker = new ServiceTracker<>(context, ICheckScheduler.class, null);
-        checkSchedulerTracker.open();
-        
-        checkRepositoryTracker = new ServiceTracker<>(context, ICheckRepository.class, null);
-        checkRepositoryTracker.open();
-        
-        bmModelManagerTracker = new ServiceTracker<>(context, IBmModelManager.class, null);
-        bmModelManagerTracker.open();
-        
-        derivedDataManagerProviderTracker = new ServiceTracker<>(context, IDerivedDataManagerProvider.class, null);
-        derivedDataManagerProviderTracker.open();
-        
-        servicesOrchestratorTracker = new ServiceTracker<>(context, IServicesOrchestrator.class, null);
-        servicesOrchestratorTracker.open();
-        
-        resourceSetProviderTracker = new ServiceTracker<>(context, BmAwareResourceSetProvider.class, null);
-        resourceSetProviderTracker.open();
-        
-        applicationManagerTracker = new ServiceTracker<>(context, IApplicationManager.class, null);
-        applicationManagerTracker.open();
-        
-        navigatorStateProviderTracker = new ServiceTracker<>(context, INavigatorContentProviderStateProvider.class, null);
-        navigatorStateProviderTracker.open();
-        
-        mdRefactoringServiceTracker = new ServiceTracker<>(context, IMdRefactoringService.class, null);
-        mdRefactoringServiceTracker.open();
+        services.init(context);
 
-        exportConfigurationFilesApiTracker = new ServiceTracker<>(
-            context, "com._1c.g5.v8.dt.cli.api.workspace.IExportConfigurationFilesApi", null); //$NON-NLS-1$
-        exportConfigurationFilesApiTracker.open();
+        // Run startup orchestration (group service + UI integrations) in the
+        // same order as before.
+        orchestrator.start(isHeadless());
 
-        importConfigurationFilesApiTracker = new ServiceTracker<>(
-            context, "com._1c.g5.v8.dt.cli.api.workspace.IImportConfigurationFilesApi", null); //$NON-NLS-1$
-        importConfigurationFilesApiTracker.open();
-
-        generateTranslationStringsApiTracker = new ServiceTracker<>(
-            context, "com.e1c.langtool.v8.dt.cli.api.IGenerateTranslationStringsApi", null); //$NON-NLS-1$
-        generateTranslationStringsApiTracker.open();
-
-        synchronizeProjectApiTracker = new ServiceTracker<>(
-            context, "com.e1c.langtool.v8.dt.cli.api.ISynchronizeProjectApi", null); //$NON-NLS-1$
-        synchronizeProjectApiTracker.open();
-
-        projectInformationApiTracker = new ServiceTracker<>(
-            context, "com.e1c.langtool.v8.dt.cli.api.IProjectInformationApi", null); //$NON-NLS-1$
-        projectInformationApiTracker.open();
-
-        // Create group service directly (not via OSGi DS to avoid circular references)
-        groupService = new com.ditrix.edt.mcp.server.groups.internal.GroupServiceImpl();
-        ((com.ditrix.edt.mcp.server.groups.internal.GroupServiceImpl) groupService).activate();
-        
-        // Initialize UI components only in non-headless mode
-        if (!isHeadless())
-        {
-            // Initialize filter manager to reset toggle state on startup
-            com.ditrix.edt.mcp.server.tags.ui.FilterByTagManager.getInstance();
-            
-            // Initialize navigator toolbar customizer to hide standard Collapse All button
-            org.eclipse.swt.widgets.Display.getDefault().asyncExec(() -> {
-                try {
-                    com.ditrix.edt.mcp.server.ui.NavigatorToolbarCustomizer.getInstance().initialize();
-                } catch (Exception e) {
-                    logError("Failed to initialize NavigatorToolbarCustomizer", e);
-                }
-            });
-        }
-        
         logInfo("EDT MCP Server plugin started"); //$NON-NLS-1$
     }
 
@@ -194,133 +92,11 @@ public class Activator extends AbstractUIPlugin
         }
         
         // Close service trackers
-        if (v8ProjectManagerTracker != null)
-        {
-            v8ProjectManagerTracker.close();
-            v8ProjectManagerTracker = null;
-        }
-        if (dtProjectManagerTracker != null)
-        {
-            dtProjectManagerTracker.close();
-            dtProjectManagerTracker = null;
-        }
-        if (configurationProviderTracker != null)
-        {
-            configurationProviderTracker.close();
-            configurationProviderTracker = null;
-        }
-        if (markerManagerTracker != null)
-        {
-            markerManagerTracker.close();
-            markerManagerTracker = null;
-        }
-        if (checkSchedulerTracker != null)
-        {
-            checkSchedulerTracker.close();
-            checkSchedulerTracker = null;
-        }
-        if (checkRepositoryTracker != null)
-        {
-            checkRepositoryTracker.close();
-            checkRepositoryTracker = null;
-        }
-        if (bmModelManagerTracker != null)
-        {
-            bmModelManagerTracker.close();
-            bmModelManagerTracker = null;
-        }
-        if (derivedDataManagerProviderTracker != null)
-        {
-            derivedDataManagerProviderTracker.close();
-            derivedDataManagerProviderTracker = null;
-        }
-        if (servicesOrchestratorTracker != null)
-        {
-            servicesOrchestratorTracker.close();
-            servicesOrchestratorTracker = null;
-        }
-        if (resourceSetProviderTracker != null)
-        {
-            resourceSetProviderTracker.close();
-            resourceSetProviderTracker = null;
-        }
-        if (applicationManagerTracker != null)
-        {
-            applicationManagerTracker.close();
-            applicationManagerTracker = null;
-        }
-        if (navigatorStateProviderTracker != null)
-        {
-            navigatorStateProviderTracker.close();
-            navigatorStateProviderTracker = null;
-        }
-        if (mdRefactoringServiceTracker != null)
-        {
-            mdRefactoringServiceTracker.close();
-            mdRefactoringServiceTracker = null;
-        }
-        if (exportConfigurationFilesApiTracker != null)
-        {
-            exportConfigurationFilesApiTracker.close();
-            exportConfigurationFilesApiTracker = null;
-        }
-        if (importConfigurationFilesApiTracker != null)
-        {
-            importConfigurationFilesApiTracker.close();
-            importConfigurationFilesApiTracker = null;
-        }
-        if (generateTranslationStringsApiTracker != null)
-        {
-            generateTranslationStringsApiTracker.close();
-            generateTranslationStringsApiTracker = null;
-        }
-        if (synchronizeProjectApiTracker != null)
-        {
-            synchronizeProjectApiTracker.close();
-            synchronizeProjectApiTracker = null;
-        }
-        if (projectInformationApiTracker != null)
-        {
-            projectInformationApiTracker.close();
-            projectInformationApiTracker = null;
-        }
+        services.dispose();
 
-        // Dispose UI components only in non-headless mode
-        if (!isHeadless())
-        {
-            // Dispose navigator toolbar customizer
-            try
-            {
-                org.eclipse.swt.widgets.Display display = org.eclipse.swt.widgets.Display.getDefault();
-                if (display != null && !display.isDisposed())
-                {
-                    display.syncExec(() -> {
-                        try
-                        {
-                            com.ditrix.edt.mcp.server.ui.NavigatorToolbarCustomizer.getInstance().dispose();
-                        }
-                        catch (Exception e)
-                        {
-                            // Ignore - workbench may be closing
-                        }
-                    });
-                }
-            }
-            catch (Exception e)
-            {
-                // Ignore - display may be disposed
-            }
-        }
-        
-        // Deactivate group service
-        if (groupService instanceof com.ditrix.edt.mcp.server.groups.internal.GroupServiceImpl impl)
-        {
-            impl.deactivate();
-        }
-        groupService = null;
-
-        // Stop update checker scheduler
-        UpdateChecker.getInstance().stopScheduler();
+        // Run shutdown orchestration (UI teardown + group service + update
+        // checker scheduler) in the same order as before.
+        orchestrator.stop(isHeadless());
 
         logInfo("EDT MCP Server plugin stopped"); //$NON-NLS-1$
         plugin = null;
@@ -344,11 +120,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IV8ProjectManager getV8ProjectManager()
     {
-        if (v8ProjectManagerTracker == null)
-        {
-            return null;
-        }
-        return v8ProjectManagerTracker.getService();
+        return services.getV8ProjectManager();
     }
 
     /**
@@ -358,11 +130,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IDtProjectManager getDtProjectManager()
     {
-        if (dtProjectManagerTracker == null)
-        {
-            return null;
-        }
-        return dtProjectManagerTracker.getService();
+        return services.getDtProjectManager();
     }
 
     /**
@@ -372,11 +140,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IConfigurationProvider getConfigurationProvider()
     {
-        if (configurationProviderTracker == null)
-        {
-            return null;
-        }
-        return configurationProviderTracker.getService();
+        return services.getConfigurationProvider();
     }
 
     /**
@@ -396,11 +160,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IMarkerManager getMarkerManager()
     {
-        if (markerManagerTracker == null)
-        {
-            return null;
-        }
-        return markerManagerTracker.getService();
+        return services.getMarkerManager();
     }
     
     /**
@@ -410,11 +170,7 @@ public class Activator extends AbstractUIPlugin
      */
     public ICheckScheduler getCheckScheduler()
     {
-        if (checkSchedulerTracker == null)
-        {
-            return null;
-        }
-        return checkSchedulerTracker.getService();
+        return services.getCheckScheduler();
     }
     
     /**
@@ -425,11 +181,7 @@ public class Activator extends AbstractUIPlugin
      */
     public ICheckRepository getCheckRepository()
     {
-        if (checkRepositoryTracker == null)
-        {
-            return null;
-        }
-        return checkRepositoryTracker.getService();
+        return services.getCheckRepository();
     }
     
     /**
@@ -439,11 +191,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IBmModelManager getBmModelManager()
     {
-        if (bmModelManagerTracker == null)
-        {
-            return null;
-        }
-        return bmModelManagerTracker.getService();
+        return services.getBmModelManager();
     }
     
     /**
@@ -454,11 +202,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IDerivedDataManagerProvider getDerivedDataManagerProvider()
     {
-        if (derivedDataManagerProviderTracker == null)
-        {
-            return null;
-        }
-        return derivedDataManagerProviderTracker.getService();
+        return services.getDerivedDataManagerProvider();
     }
     
     /**
@@ -469,11 +213,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IServicesOrchestrator getServicesOrchestrator()
     {
-        if (servicesOrchestratorTracker == null)
-        {
-            return null;
-        }
-        return servicesOrchestratorTracker.getService();
+        return services.getServicesOrchestrator();
     }
     
     /**
@@ -484,11 +224,7 @@ public class Activator extends AbstractUIPlugin
      */
     public BmAwareResourceSetProvider getResourceSetProvider()
     {
-        if (resourceSetProviderTracker == null)
-        {
-            return null;
-        }
-        return resourceSetProviderTracker.getService();
+        return services.getResourceSetProvider();
     }
     
     /**
@@ -499,11 +235,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IApplicationManager getApplicationManager()
     {
-        if (applicationManagerTracker == null)
-        {
-            return null;
-        }
-        return applicationManagerTracker.getService();
+        return services.getApplicationManager();
     }
     
     /**
@@ -514,11 +246,7 @@ public class Activator extends AbstractUIPlugin
      */
     public INavigatorContentProviderStateProvider getNavigatorStateProvider()
     {
-        if (navigatorStateProviderTracker == null)
-        {
-            return null;
-        }
-        return navigatorStateProviderTracker.getService();
+        return services.getNavigatorStateProvider();
     }
     
     /**
@@ -528,11 +256,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IMdRefactoringService getMdRefactoringService()
     {
-        if (mdRefactoringServiceTracker == null)
-        {
-            return null;
-        }
-        return mdRefactoringServiceTracker.getService();
+        return services.getMdRefactoringService();
     }
 
     /**
@@ -552,23 +276,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IModelObjectFactory getModelObjectFactory()
     {
-        try
-        {
-            MdPlugin mdPlugin = MdPlugin.getDefault();
-            if (mdPlugin != null)
-            {
-                Injector injector = mdPlugin.getInjector();
-                if (injector != null)
-                {
-                    return injector.getInstance(IModelObjectFactory.class);
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            logError("Failed to obtain MD IModelObjectFactory from MdPlugin injector", e); //$NON-NLS-1$
-        }
-        return null;
+        return services.getModelObjectFactory();
     }
 
     /**
@@ -579,11 +287,7 @@ public class Activator extends AbstractUIPlugin
      */
     public Object getExportConfigurationFilesApi()
     {
-        if (exportConfigurationFilesApiTracker == null)
-        {
-            return null;
-        }
-        return exportConfigurationFilesApiTracker.getService();
+        return services.getExportConfigurationFilesApi();
     }
 
     /**
@@ -594,11 +298,7 @@ public class Activator extends AbstractUIPlugin
      */
     public Object getImportConfigurationFilesApi()
     {
-        if (importConfigurationFilesApiTracker == null)
-        {
-            return null;
-        }
-        return importConfigurationFilesApiTracker.getService();
+        return services.getImportConfigurationFilesApi();
     }
 
     /**
@@ -618,11 +318,7 @@ public class Activator extends AbstractUIPlugin
      */
     public Object getGenerateTranslationStringsApi()
     {
-        if (generateTranslationStringsApiTracker == null)
-        {
-            return null;
-        }
-        return generateTranslationStringsApiTracker.getService();
+        return services.getGenerateTranslationStringsApi();
     }
 
     /**
@@ -639,11 +335,7 @@ public class Activator extends AbstractUIPlugin
      */
     public Object getSynchronizeProjectApi()
     {
-        if (synchronizeProjectApiTracker == null)
-        {
-            return null;
-        }
-        return synchronizeProjectApiTracker.getService();
+        return services.getSynchronizeProjectApi();
     }
 
     /**
@@ -653,11 +345,7 @@ public class Activator extends AbstractUIPlugin
      */
     public Object getProjectInformationApi()
     {
-        if (projectInformationApiTracker == null)
-        {
-            return null;
-        }
-        return projectInformationApiTracker.getService();
+        return services.getProjectInformationApi();
     }
 
     /**
@@ -668,7 +356,7 @@ public class Activator extends AbstractUIPlugin
      */
     public IGroupService getGroupService()
     {
-        return groupService;
+        return orchestrator.getGroupService();
     }
     
     /**
@@ -689,10 +377,7 @@ public class Activator extends AbstractUIPlugin
      */
     public static void logInfo(String message)
     {
-        if (plugin != null)
-        {
-            plugin.getLog().log(new Status(IStatus.INFO, PLUGIN_ID, message));
-        }
+        Log.info(message);
     }
     
     /**
@@ -703,11 +388,7 @@ public class Activator extends AbstractUIPlugin
      */
     public static void logDebug(String message)
     {
-        // Disabled by default - enable by uncommenting the body below for troubleshooting
-        // if (plugin != null)
-        // {
-        //     plugin.getLog().log(new Status(IStatus.INFO, PLUGIN_ID, "[DEBUG] " + message));
-        // }
+        Log.debug(message);
     }
 
     /**
@@ -717,10 +398,7 @@ public class Activator extends AbstractUIPlugin
      */
     public static void logWarning(String message)
     {
-        if (plugin != null)
-        {
-            plugin.getLog().log(new Status(IStatus.WARNING, PLUGIN_ID, message));
-        }
+        Log.warning(message);
     }
 
     /**
@@ -731,10 +409,7 @@ public class Activator extends AbstractUIPlugin
      */
     public static void logError(String message, Throwable e)
     {
-        if (plugin != null)
-        {
-            plugin.getLog().log(new Status(IStatus.ERROR, PLUGIN_ID, message, e));
-        }
+        Log.error(message, e);
     }
 
     /**

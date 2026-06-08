@@ -23,14 +23,15 @@ import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.preferences.ToolParameterSettings;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
 
 /**
- * Terminates 1С launches started from this EDT instance. The set of
+ * Terminates 1C launches started from this EDT instance. The set of
  * affectable launches is constrained by {@link ILaunchManager#getLaunches()} —
- * any 1С client started externally (Designer, ad-hoc {@code 1cv8c.exe},
+ * any 1C client started externally (Designer, ad-hoc {@code 1cv8c.exe},
  * another EDT instance) is invisible to this tool and therefore safe.
  *
  * <p>Three selection modes (mutually exclusive):
@@ -42,13 +43,13 @@ import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
  * </ul>
  *
  * <p>Attach launches ({@code RemoteRuntime} / {@code LocalRuntime}) are
- * disconnected, not killed — the 1С cluster keeps running. Set
+ * disconnected, not killed — the 1C cluster keeps running. Set
  * {@code includeAttach=false} to skip them entirely.
  *
  * <p>By default the tool waits up to {@code timeoutSeconds} for a polite
  * {@link ILaunch#terminate()} to take effect. With {@code force=true}, an
  * unfinished termination escalates to {@link IProcess#terminate()} on the
- * launch's processes — this can lose unsaved 1С state.
+ * launch's processes — this can lose unsaved 1C state.
  */
 public class TerminateLaunchTool implements IMcpTool
 {
@@ -80,15 +81,10 @@ public class TerminateLaunchTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Terminate one or more 1С launches that were started from THIS EDT instance " //$NON-NLS-1$
-            + "(runtime-client or Attach). Only launches visible via the Eclipse launch manager " //$NON-NLS-1$
-            + "can be affected — 1С clients started externally (Designer, ad-hoc 1cv8c.exe, " //$NON-NLS-1$
-            + "another EDT) are never touched. " //$NON-NLS-1$
-            + "Select target via launchConfigurationName, or projectName+applicationId, " //$NON-NLS-1$
-            + "or all=true (requires confirm=true). " //$NON-NLS-1$
-            + "Attach configurations are disconnected (the 1С server keeps running) — " //$NON-NLS-1$
-            + "set includeAttach=false to skip them. " //$NON-NLS-1$
-            + "Use list_configurations first to see what is currently running."; //$NON-NLS-1$
+        return "Terminate one or more 1C launches started from THIS EDT instance; externally " //$NON-NLS-1$
+            + "launched 1C clients are never touched. Select ONE target mode: " //$NON-NLS-1$
+            + "launchConfigurationName, projectName+applicationId, or all=true (needs confirm=true). " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('terminate_launch')."; //$NON-NLS-1$
     }
 
     @Override
@@ -96,29 +92,27 @@ public class TerminateLaunchTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .stringProperty("launchConfigurationName", //$NON-NLS-1$
-                "Exact EDT launch configuration name (from list_configurations) to terminate.") //$NON-NLS-1$
+                "Exact launch configuration name from list_configurations (single-launch mode).") //$NON-NLS-1$
             .stringProperty("projectName", //$NON-NLS-1$
-                "EDT project name. Combine with applicationId for a single launch, or with " //$NON-NLS-1$
-                    + "all=true to narrow 'terminate all' to one project.") //$NON-NLS-1$
+                "EDT project name; pair with applicationId for one launch, or with all=true.") //$NON-NLS-1$
             .stringProperty("applicationId", //$NON-NLS-1$
-                "Application ID from get_applications. Requires projectName.") //$NON-NLS-1$
+                "Application ID from get_applications; requires projectName.") //$NON-NLS-1$
             .booleanProperty("all", //$NON-NLS-1$
-                "Terminate every live EDT launch (optionally narrowed by projectName). " //$NON-NLS-1$
-                    + "Requires confirm=true. Default: false.") //$NON-NLS-1$
+                "Terminate every live EDT launch (optionally narrowed by projectName); " //$NON-NLS-1$
+                    + "requires confirm=true. Default false.") //$NON-NLS-1$
             .booleanProperty("confirm", //$NON-NLS-1$
-                "Must be true when all=true. Guard against accidental mass termination.") //$NON-NLS-1$
+                "Required (true) when all=true; guards against accidental mass termination.") //$NON-NLS-1$
             .booleanProperty("force", //$NON-NLS-1$
-                "If a polite ILaunch.terminate() does not finish within timeoutSeconds, " //$NON-NLS-1$
-                    + "escalate to IProcess.terminate() (OS-level kill). " //$NON-NLS-1$
-                    + "May lose unsaved 1С state. Default: false. Ignored for Attach.") //$NON-NLS-1$
+                "On polite-termination timeout, escalate to an OS-level process kill; " //$NON-NLS-1$
+                    + "may lose unsaved 1C state. Default false. Ignored for Attach.") //$NON-NLS-1$
+            .integerProperty("timeout", //$NON-NLS-1$
+                "Polite-wait window per launch in seconds, clamped to [1, 120]. " //$NON-NLS-1$
+                    + "Default from EDT preferences (factory default 10).") //$NON-NLS-1$
             .integerProperty("timeoutSeconds", //$NON-NLS-1$
-                "How long to wait for a polite termination per launch. " //$NON-NLS-1$
-                    + "Default is configured in EDT preferences (MCP Server → Tools → terminate_launch), " //$NON-NLS-1$
-                    + "factory default 10. Clamped to [1, 120].") //$NON-NLS-1$
+                "Deprecated alias of 'timeout' (kept for backward compatibility).") //$NON-NLS-1$
             .booleanProperty("includeAttach", //$NON-NLS-1$
-                "Whether to act on Attach configurations (RemoteRuntime/LocalRuntime). " //$NON-NLS-1$
-                    + "When true, Attach launches are disconnected (the 1С cluster keeps running). " //$NON-NLS-1$
-                    + "Default: true.") //$NON-NLS-1$
+                "Whether to act on Attach configs (disconnected, server keeps running). " //$NON-NLS-1$
+                    + "Default true; set false to skip them.") //$NON-NLS-1$
             .build();
     }
 
@@ -179,7 +173,10 @@ public class TerminateLaunchTool implements IMcpTool
         boolean includeAttach = JsonUtils.extractBooleanArgument(params, "includeAttach", true); //$NON-NLS-1$
         int configuredDefault = ToolParameterSettings.getInstance()
             .getParameterValue(NAME, "timeoutSeconds", DEFAULT_TIMEOUT_SECONDS); //$NON-NLS-1$
-        int timeoutSeconds = JsonUtils.extractIntArgument(params, "timeoutSeconds", configuredDefault); //$NON-NLS-1$
+        // Canonical 'timeout' (aligned with run_yaxunit_tests); 'timeoutSeconds' is a
+        // back-compat alias. Prefer 'timeout' when present, else the alias, else the default.
+        int timeoutSeconds = JsonUtils.extractIntArgument(params, "timeout", //$NON-NLS-1$
+            JsonUtils.extractIntArgument(params, "timeoutSeconds", configuredDefault)); //$NON-NLS-1$
         if (timeoutSeconds < 1)
         {
             timeoutSeconds = 1;
@@ -204,7 +201,7 @@ public class TerminateLaunchTool implements IMcpTool
             ILaunchManager launchManager = LaunchConfigUtils.getLaunchManager();
             if (launchManager == null)
             {
-                return "**Error:** Launch manager is not available."; //$NON-NLS-1$
+                return ToolResult.error("Launch manager is not available.").toJson(); //$NON-NLS-1$
             }
 
             List<ILaunch> targets = selectTargets(launchManager, configName, projectName,
@@ -242,7 +239,7 @@ public class TerminateLaunchTool implements IMcpTool
         catch (RuntimeException e)
         {
             Activator.logError("Error in terminate_launch", e); //$NON-NLS-1$
-            return "**Error:** " + e.getMessage(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson();
         }
     }
 
@@ -266,40 +263,40 @@ public class TerminateLaunchTool implements IMcpTool
 
         if (modeCount > 1)
         {
-            return "**Error:** Selection modes are mutually exclusive. " //$NON-NLS-1$
+            return ToolResult.error("Selection modes are mutually exclusive. " //$NON-NLS-1$
                 + "Choose ONE of: `launchConfigurationName`, " //$NON-NLS-1$
-                + "`projectName + applicationId`, or `all=true`."; //$NON-NLS-1$
+                + "`projectName + applicationId`, or `all=true`.").toJson(); //$NON-NLS-1$
         }
         // applicationId without all=true makes sense only paired with projectName.
         // When hasName is set, name fully determines the target — extras are ignored.
         if (hasAppId && !hasProject && !all && !hasName)
         {
-            return "**Error:** `applicationId` requires `projectName`."; //$NON-NLS-1$
+            return ToolResult.error("`applicationId` requires `projectName`.").toJson(); //$NON-NLS-1$
         }
         // applicationId is meaningless with all=true — that mode is project-scoped at best.
         if (hasAppId && all)
         {
-            return "**Error:** `applicationId` cannot be combined with `all=true`. " //$NON-NLS-1$
+            return ToolResult.error("`applicationId` cannot be combined with `all=true`. " //$NON-NLS-1$
                 + "Use `projectName + applicationId` for a single launch, or " //$NON-NLS-1$
-                + "`all=true` (optionally with `projectName`) for mass termination."; //$NON-NLS-1$
+                + "`all=true` (optionally with `projectName`) for mass termination.").toJson(); //$NON-NLS-1$
         }
         // projectName alone, without applicationId and without all=true, is ambiguous.
         if (hasProject && !hasAppId && !all && !hasName)
         {
-            return "**Error:** `projectName` alone is not a selection. " //$NON-NLS-1$
+            return ToolResult.error("`projectName` alone is not a selection. " //$NON-NLS-1$
                 + "Add `applicationId` for a single launch, or `all=true` " //$NON-NLS-1$
-                + "to terminate every live launch of that project."; //$NON-NLS-1$
+                + "to terminate every live launch of that project.").toJson(); //$NON-NLS-1$
         }
         if (modeCount == 0)
         {
-            return "**Error:** Provide exactly one of: `launchConfigurationName`, " //$NON-NLS-1$
-                + "`projectName + applicationId`, or `all=true`."; //$NON-NLS-1$
+            return ToolResult.error("Provide exactly one of: `launchConfigurationName`, " //$NON-NLS-1$
+                + "`projectName + applicationId`, or `all=true`.").toJson(); //$NON-NLS-1$
         }
         if (all && !confirm)
         {
-            return "**Error:** Confirmation required: pass `confirm=true` to terminate " //$NON-NLS-1$
-                + "ALL EDT-launched 1С instances. Use `list_configurations` first to see " //$NON-NLS-1$
-                + "what is currently running."; //$NON-NLS-1$
+            return ToolResult.error("Confirmation required: pass `confirm=true` to terminate " //$NON-NLS-1$
+                + "ALL EDT-launched 1C instances. Use `list_configurations` first to see " //$NON-NLS-1$
+                + "what is currently running.").toJson(); //$NON-NLS-1$
         }
         return null;
     }
@@ -464,7 +461,7 @@ public class TerminateLaunchTool implements IMcpTool
      * Wait criterion for attach launches: success when every debug target is
      * either terminated OR disconnected. Per Eclipse Debug Platform contract,
      * {@link IDisconnect#disconnect()} does not flip {@link ILaunch#isTerminated()};
-     * the 1С server keeps running, only the debugger detaches.
+     * the 1C server keeps running, only the debugger detaches.
      */
     private static boolean waitForAttachDone(ILaunch launch, long maxMillis)
     {
@@ -619,11 +616,11 @@ public class TerminateLaunchTool implements IMcpTool
         if (detached > 0)
         {
             sb.append("\n> Attach configurations only disconnect the debugger — " //$NON-NLS-1$
-                + "the 1С server (ragent/rphost) keeps running. " //$NON-NLS-1$
+                + "the 1C server (ragent/rphost) keeps running. " //$NON-NLS-1$
                 + "Pass `includeAttach=false` to skip Attach launches entirely.\n"); //$NON-NLS-1$
         }
         sb.append("\n> Only launches started from this EDT instance are affected. " //$NON-NLS-1$
-            + "Externally launched 1С clients are not touched by this tool.\n"); //$NON-NLS-1$
+            + "Externally launched 1C clients are not touched by this tool.\n"); //$NON-NLS-1$
         return sb.toString();
     }
 

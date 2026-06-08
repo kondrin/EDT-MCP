@@ -12,7 +12,6 @@ import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
 
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
@@ -22,11 +21,10 @@ import com.ditrix.edt.mcp.server.tags.TagService;
 import com.ditrix.edt.mcp.server.tags.model.Tag;
 import com.ditrix.edt.mcp.server.tags.model.TagStorage;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
+import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
+import com.ditrix.edt.mcp.server.utils.Pagination;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonParser;
 
 /**
  * Tool to get metadata objects filtered by tags.
@@ -59,7 +57,7 @@ public class GetObjectsByTagsTool implements IMcpTool
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringArrayProperty("tags", //$NON-NLS-1$
                 "Array of tag names to filter by (e.g. ['Important', 'NeedsReview']). " + //$NON-NLS-1$
-                "Returns objects that have ANY of these tags. Required.") //$NON-NLS-1$
+                "Returns objects that have ANY of these tags. Required.", true) //$NON-NLS-1$
             .integerProperty("limit", //$NON-NLS-1$
                 "Maximum number of objects to return per tag. Default: 100") //$NON-NLS-1$
             .build();
@@ -69,47 +67,40 @@ public class GetObjectsByTagsTool implements IMcpTool
     public String execute(Map<String, String> params)
     {
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
-        String tagsJson = JsonUtils.extractStringArgument(params, "tags"); //$NON-NLS-1$
-        String limitStr = JsonUtils.extractStringArgument(params, "limit"); //$NON-NLS-1$
-        
-        if (projectName == null || projectName.isEmpty())
+
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return ToolResult.error("Project name is required").toJson(); //$NON-NLS-1$
+            return err;
         }
         
-        // Check if project is ready for operations
-        String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-        if (notReadyError != null)
+        // Refuse only the transient BUILDING state; a missing/closed project falls
+        // through to the value-naming "Project not found: <name>" below instead of a
+        // misleading "Project does not exist. Please wait and retry."
+        String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+        if (building != null)
         {
-            return ToolResult.error(notReadyError).toJson();
+            return ToolResult.error(building).toJson();
         }
-        
-        // Parse tags array
-        List<String> tagNames = parseTagsList(tagsJson);
-        if (tagNames.isEmpty())
+
+        // Tags list: accepts a JSON array (["Important","NeedsReview"]) or a
+        // comma-separated string, via the shared extractArrayArgument helper.
+        List<String> tagNames = JsonUtils.extractArrayArgument(params, "tags"); //$NON-NLS-1$
+        if (tagNames == null || tagNames.isEmpty())
         {
             return ToolResult.error("Tags array is required. Example: [\"Important\", \"NeedsReview\"]").toJson(); //$NON-NLS-1$
         }
         
-        int limit = 100;
-        if (limitStr != null && !limitStr.isEmpty())
+        int limit = JsonUtils.extractIntArgument(params, "limit", 100); //$NON-NLS-1$
+        limit = Pagination.clampLimit(limit, 1000);
+
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            try
-            {
-                limit = Math.min(Integer.parseInt(limitStr), 1000);
-            }
-            catch (NumberFormatException e)
-            {
-                // Use default
-            }
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
-        
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
-        {
-            return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
-        }
-        
+        IProject project = ctx.project();
+
         try
         {
             return getObjectsByTags(project, tagNames, limit);
@@ -121,41 +112,6 @@ public class GetObjectsByTagsTool implements IMcpTool
         }
     }
     
-    /**
-     * Parses the tags array from JSON string.
-     * 
-     * @param tagsJson JSON array string like ["Important", "NeedsReview"]
-     * @return list of tag names
-     */
-    private List<String> parseTagsList(String tagsJson)
-    {
-        List<String> result = new ArrayList<>();
-        if (tagsJson == null || tagsJson.isEmpty())
-        {
-            return result;
-        }
-        
-        try
-        {
-            JsonElement element = JsonParser.parseString(tagsJson);
-            if (element.isJsonArray())
-            {
-                JsonArray array = element.getAsJsonArray();
-                for (JsonElement item : array)
-                {
-                    if (item.isJsonPrimitive() && item.getAsJsonPrimitive().isString())
-                    {
-                        result.add(item.getAsString());
-                    }
-                }
-            }
-        }
-        catch (JsonParseException e)
-        {
-            Activator.logError("Error parsing tags JSON: " + tagsJson, e); //$NON-NLS-1$
-        }
-        return result;
-    }
     
     /**
      * Gets objects filtered by tags.
@@ -205,19 +161,18 @@ public class GetObjectsByTagsTool implements IMcpTool
             }
             else
             {
-                sb.append("| # | Object FQN |\n"); //$NON-NLS-1$
-                sb.append("|---|------------|\n"); //$NON-NLS-1$
-                
+                sb.append(MarkdownUtils.tableHeader("#", "Object FQN")); //$NON-NLS-1$ //$NON-NLS-2$
+
                 int count = 0;
                 for (String fqn : objects)
                 {
                     if (count >= limit)
                     {
-                        sb.append("| ... | *").append(objects.size() - limit) //$NON-NLS-1$
-                          .append(" more objects (limit reached)* |\n"); //$NON-NLS-1$
+                        sb.append(MarkdownUtils.tableRow("...", //$NON-NLS-1$
+                            "*" + (objects.size() - limit) + " more objects (limit reached)*")); //$NON-NLS-1$ //$NON-NLS-2$
                         break;
                     }
-                    sb.append("| ").append(++count).append(" | ").append(fqn).append(" |\n"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                    sb.append(MarkdownUtils.tableRow(String.valueOf(++count), fqn));
                 }
                 sb.append("\n"); //$NON-NLS-1$
                 totalObjects += Math.min(objects.size(), limit);

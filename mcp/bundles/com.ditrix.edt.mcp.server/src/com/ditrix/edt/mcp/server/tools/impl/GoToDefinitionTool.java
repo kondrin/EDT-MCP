@@ -13,7 +13,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.Path;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
@@ -28,9 +27,12 @@ import com._1c.g5.v8.dt.metadata.mdclass.MdObject;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.FrontMatter;
 import com.ditrix.edt.mcp.server.utils.MetadataTypeUtils;
+import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool to navigate to the definition of a symbol (method, metadata object).
@@ -53,10 +55,12 @@ public class GoToDefinitionTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Go to definition of a symbol. " + //$NON-NLS-1$
-               "Resolves 'ModuleName.MethodName' to source code and location. " + //$NON-NLS-1$
-               "Also resolves metadata FQNs like 'Catalog.Products'. " + //$NON-NLS-1$
-               "Supports Russian type names."; //$NON-NLS-1$
+        return "Go to the definition of a symbol (the inverse of find_references): a qualified " + //$NON-NLS-1$
+               "method 'ModuleName.MethodName', a bare 'MethodName' (also pass modulePath), or a " + //$NON-NLS-1$
+               "metadata FQN like 'Catalog.Products'. A bare method name requires modulePath. " + //$NON-NLS-1$
+               "Use this for where a symbol is DEFINED; for all its USAGES use find_references, " + //$NON-NLS-1$
+               "for a literal (non-symbol) text scan use search_in_code. " + //$NON-NLS-1$
+               "Full parameters and examples: call get_tool_guide('go_to_definition')."; //$NON-NLS-1$
     }
 
     @Override
@@ -66,12 +70,12 @@ public class GoToDefinitionTool implements IMcpTool
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name", true) //$NON-NLS-1$
             .stringProperty("symbol", //$NON-NLS-1$
-                "Formats: 'ModuleName.MethodName', 'MethodName' (needs modulePath), " + //$NON-NLS-1$
-                "'Catalog.Products' (metadata FQN). Russian type names supported.", true) //$NON-NLS-1$
+                "'ModuleName.MethodName', bare 'MethodName' (needs modulePath), or metadata FQN " + //$NON-NLS-1$
+                "'Catalog.Products'", true) //$NON-NLS-1$
             .stringProperty("modulePath", //$NON-NLS-1$
-                "Module path from src/. Required for unqualified method names.") //$NON-NLS-1$
+                "Module path from src/, e.g. 'CommonModules/My/Module.bsl'; required for a bare method name") //$NON-NLS-1$
             .booleanProperty("includeSource", //$NON-NLS-1$
-                "Include source code (default: true)") //$NON-NLS-1$
+                "Include the source body (default true)") //$NON-NLS-1$
             .build();
     }
 
@@ -96,21 +100,26 @@ public class GoToDefinitionTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
+        String err = JsonUtils.requireArguments(params, "projectName", "symbol"); //$NON-NLS-1$ //$NON-NLS-2$
+        if (err != null)
+        {
+            return err;
+        }
+
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         String symbol = JsonUtils.extractStringArgument(params, "symbol"); //$NON-NLS-1$
         String modulePath = JsonUtils.extractStringArgument(params, "modulePath"); //$NON-NLS-1$
         String includeSourceStr = JsonUtils.extractStringArgument(params, "includeSource"); //$NON-NLS-1$
 
-        if (projectName == null || projectName.isEmpty())
-        {
-            return "Error: projectName is required"; //$NON-NLS-1$
-        }
-        if (symbol == null || symbol.isEmpty())
-        {
-            return "Error: symbol is required"; //$NON-NLS-1$
-        }
-
         boolean includeSource = !"false".equalsIgnoreCase(includeSourceStr); //$NON-NLS-1$
+
+        // An unqualified method name (no dot) cannot be located without a module.
+        if (symbol != null && !symbol.contains(".") //$NON-NLS-1$
+            && (modulePath == null || modulePath.isEmpty()))
+        {
+            return ToolResult.error("modulePath is required for an unqualified method name like '" //$NON-NLS-1$
+                + symbol + "'. Or pass a qualified 'ModuleName.MethodName' or a metadata FQN like 'Catalog.Products'.").toJson(); //$NON-NLS-1$
+        }
 
         // Execute on UI thread (required for EDT API access)
         AtomicReference<String> resultRef = new AtomicReference<>();
@@ -125,7 +134,7 @@ public class GoToDefinitionTool implements IMcpTool
             catch (Exception e)
             {
                 Activator.logError("Error resolving definition", e); //$NON-NLS-1$
-                resultRef.set("Error: " + e.getMessage()); //$NON-NLS-1$
+                resultRef.set(ToolResult.error(e.getMessage()).toJson());
             }
         });
 
@@ -140,11 +149,12 @@ public class GoToDefinitionTool implements IMcpTool
      */
     private String resolveDefinition(String projectName, String symbol, String modulePath, boolean includeSource)
     {
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
 
         // Normalize Russian metadata type names: "Документ.Встреча" -> "Document.Встреча"
         symbol = MetadataTypeUtils.normalizeFqn(symbol);
@@ -178,13 +188,13 @@ public class GoToDefinitionTool implements IMcpTool
         IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
         if (configProvider == null)
         {
-            return "Error: Configuration provider not available"; //$NON-NLS-1$
+            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
         }
 
         Configuration config = configProvider.getConfiguration(project);
         if (config == null)
         {
-            return "Error: Could not get configuration for project"; //$NON-NLS-1$
+            return ToolResult.error("Could not get configuration for project").toJson(); //$NON-NLS-1$
         }
 
         // 1. Try as CommonModule method: firstPart = module name, secondPart = method name
@@ -215,9 +225,9 @@ public class GoToDefinitionTool implements IMcpTool
     {
         if (modulePath == null || modulePath.isEmpty())
         {
-            return "Error: modulePath is required when symbol is an unqualified method name. " + //$NON-NLS-1$
+            return ToolResult.error("modulePath is required when symbol is an unqualified method name. " + //$NON-NLS-1$
                    "Provide the context module path (e.g. 'CommonModules/MyModule/Module.bsl') " + //$NON-NLS-1$
-                   "or use qualified name 'ModuleName.MethodName'."; //$NON-NLS-1$
+                   "or use qualified name 'ModuleName.MethodName'.").toJson(); //$NON-NLS-1$
         }
 
         return resolveMethodInModule(project, projectName, modulePath, methodName, includeSource, null);
@@ -261,7 +271,7 @@ public class GoToDefinitionTool implements IMcpTool
         String typeStr = method instanceof Function ? "Function" : "Procedure"; //$NON-NLS-1$ //$NON-NLS-2$
 
         // Read source from file
-        IFile file = project.getFile(new Path("src").append(modulePath)); //$NON-NLS-1$
+        IFile file = BslModuleUtils.resolveModuleFile(project, modulePath);
         List<String> allLines = null;
         try
         {
@@ -349,71 +359,27 @@ public class GoToDefinitionTool implements IMcpTool
     private String resolveMethodViaText(IProject project, String projectName, String modulePath,
                                          String methodName, boolean includeSource, String qualifiedPrefix)
     {
-        IFile file = project.getFile(new Path("src").append(modulePath)); //$NON-NLS-1$
+        IFile file = BslModuleUtils.resolveModuleFile(project, modulePath);
         if (!file.exists())
         {
-            return "Error: Module not found: src/" + modulePath; //$NON-NLS-1$
+            return ToolResult.error("Module not found: src/" + modulePath).toJson(); //$NON-NLS-1$
         }
 
         try
         {
             List<String> allLines = BslModuleUtils.readFileLines(file);
 
-            int methodStart = -1;
-            int methodEnd = -1;
-            String matchedName = null;
-            boolean isFunction = false;
-            List<String> allMethodNames = new ArrayList<>();
-
-            for (int i = 0; i < allLines.size(); i++)
+            // Locate the method via the shared text-scan fallback.
+            BslModuleUtils.TextMethod tm = BslModuleUtils.findMethodViaText(allLines, methodName);
+            if (!tm.found)
             {
-                java.util.regex.Matcher startMatcher = BslModuleUtils.METHOD_START_PATTERN.matcher(allLines.get(i));
-                if (startMatcher.find())
-                {
-                    String foundName = startMatcher.group(1);
-                    allMethodNames.add(foundName);
-
-                    if (foundName.equalsIgnoreCase(methodName))
-                    {
-                        methodStart = i;
-                        matchedName = foundName;
-                        isFunction = BslModuleUtils.FUNC_KEYWORD_PATTERN.matcher(allLines.get(i)).find();
-                    }
-                }
-
-                if (methodStart >= 0 && methodEnd < 0)
-                {
-                    java.util.regex.Matcher endMatcher = BslModuleUtils.METHOD_END_PATTERN.matcher(allLines.get(i));
-                    if (endMatcher.find())
-                    {
-                        methodEnd = i;
-                        break;
-                    }
-                }
+                return BslModuleUtils.buildTextMethodNotFoundResponse(methodName, modulePath, tm.allMethodNames);
             }
 
-            if (methodStart < 0)
-            {
-                StringBuilder sb = new StringBuilder();
-                sb.append("Error: Method '").append(methodName).append("' not found in ").append(modulePath).append("\n\n"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-                sb.append("**Available methods** (").append(allMethodNames.size()).append("):\n\n"); //$NON-NLS-1$ //$NON-NLS-2$
-                for (String name : allMethodNames)
-                {
-                    sb.append("- ").append(name).append("\n"); //$NON-NLS-1$ //$NON-NLS-2$
-                }
-                return sb.toString();
-            }
-
-            if (methodEnd < 0)
-            {
-                methodEnd = allLines.size() - 1;
-            }
-
-            // Include doc-comment
-            int docStart = findDocCommentStart(allLines, methodStart + 1) - 1;
-            methodStart = docStart;
-
-            String typeStr = isFunction ? "Function" : "Procedure"; //$NON-NLS-1$ //$NON-NLS-2$
+            int methodStart = tm.startLine;
+            int methodEnd = tm.endLine;
+            String matchedName = tm.matchedName;
+            String typeStr = tm.isFunction ? "Function" : "Procedure"; //$NON-NLS-1$ //$NON-NLS-2$
 
             // Find containing region
             String region = BslModuleUtils.findRegionForLine(allLines, methodStart + 1);
@@ -452,7 +418,7 @@ public class GoToDefinitionTool implements IMcpTool
         }
         catch (Exception e)
         {
-            return "Error reading file: " + e.getMessage(); //$NON-NLS-1$
+            return ToolResult.error("Error reading file: " + e.getMessage()).toJson(); //$NON-NLS-1$
         }
     }
 
@@ -661,18 +627,8 @@ public class GoToDefinitionTool implements IMcpTool
      */
     private int findDocCommentStart(List<String> allLines, int methodKeywordLine)
     {
-        if (methodKeywordLine <= 1)
-        {
-            return methodKeywordLine;
-        }
-
-        int idx = methodKeywordLine - 2; // 0-indexed, line before the keyword
-        while (idx >= 0 && allLines.get(idx).trim().startsWith("//")) //$NON-NLS-1$
-        {
-            idx--;
-        }
-
-        int docStart = idx + 2; // convert back to 1-based
-        return docStart < methodKeywordLine ? docStart : methodKeywordLine;
+        // Delegate to the shared ADJACENCY-policy helper (stop at first blank or
+        // non-comment line) so all read-tools share one boundary rule.
+        return BslModuleUtils.findDocCommentStartLine(allLines, methodKeywordLine);
     }
 }

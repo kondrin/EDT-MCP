@@ -14,8 +14,6 @@ import java.util.List;
 import java.util.Map;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
 
 import com._1c.g5.v8.dt.core.platform.IDtProject;
 import com._1c.g5.v8.dt.core.platform.IDtProjectManager;
@@ -26,6 +24,7 @@ import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.BuildUtils;
 import com.ditrix.edt.mcp.server.utils.FrontMatter;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 
 /**
@@ -67,14 +66,12 @@ public class GenerateTranslationStringsTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Generate translation strings (.lstr/.trans/.dict) for a " //$NON-NLS-1$
-             + "configuration project — scans translatable features and writes " //$NON-NLS-1$
-             + "the resulting keys into the storages declared on the project. " //$NON-NLS-1$
-             + "Equivalent of the EDT menu Translation -> Generate translation " //$NON-NLS-1$
-             + "strings. Invoke on the configuration project " //$NON-NLS-1$
-             + "(V8ConfigurationNature), NOT on a dictionary storage project " //$NON-NLS-1$
-             + "(plain Eclipse project where .lstr/.trans/.dict live). " //$NON-NLS-1$
-             + "Requires LanguageTool installed in EDT."; //$NON-NLS-1$
+        return "Generate translation strings (.lstr/.trans/.dict) for a configuration " //$NON-NLS-1$
+             + "project: scans translatable features and writes the resulting keys into " //$NON-NLS-1$
+             + "the project's storages (EDT menu Translation -> Generate translation " //$NON-NLS-1$
+             + "strings). Run on the configuration project (V8ConfigurationNature), not " //$NON-NLS-1$
+             + "a dictionary storage project; requires LanguageTool installed in EDT. " //$NON-NLS-1$
+             + "Full parameters and examples: call get_tool_guide('generate_translation_strings')."; //$NON-NLS-1$
     }
 
     @Override
@@ -82,27 +79,22 @@ public class GenerateTranslationStringsTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .stringProperty("projectName", //$NON-NLS-1$
-                "Configuration project name (V8ConfigurationNature). NOT a dictionary " //$NON-NLS-1$
-              + "storage project (the plain Eclipse project where .lstr/.trans/.dict " //$NON-NLS-1$
-              + "live) — pass the configuration whose translatable features should be " //$NON-NLS-1$
-              + "scanned. Required.", true)
+                "Configuration project name (V8ConfigurationNature), not a dictionary storage project. Required.", //$NON-NLS-1$
+                true)
             .stringArrayProperty("targetLanguages", //$NON-NLS-1$
-                "Target language codes to generate strings for, e.g. [\"en\"] (required).", true) //$NON-NLS-1$
+                "Target language codes to generate, e.g. [\"en\"]. Required.", true) //$NON-NLS-1$
             .stringProperty("storageId", //$NON-NLS-1$
-                "Storage ID to write generated keys into. Use get_translation_project_info to list " //$NON-NLS-1$
-              + "available storages. Default: \"edit:default\".")
+                "Storage ID to write keys into (see get_translation_project_info). Default: \"edit:default\".") //$NON-NLS-1$
             .booleanProperty("collectInterface", //$NON-NLS-1$
                 "Generate interface (.lstr) keys. Default: true.") //$NON-NLS-1$
             .booleanProperty("collectModel", //$NON-NLS-1$
                 "Generate model (.trans) keys. Default: true.") //$NON-NLS-1$
             .stringProperty("collectModelType", //$NON-NLS-1$
-                "Model collection mode: ANY | NONE | COMPUTED_ONLY | UNKNOWN_ONLY | TAGS_ONLY. Default: ANY.") //$NON-NLS-1$
+                "Model mode: ANY | NONE | COMPUTED_ONLY | UNKNOWN_ONLY | TAGS_ONLY. Default: ANY.") //$NON-NLS-1$
             .stringProperty("fillUpType", //$NON-NLS-1$
-                "Pre-fill new keys with values from: NOT_FILLUP | FROM_SOURCE_LANGUAGE | FROM_PROVIDER. Default: NOT_FILLUP.") //$NON-NLS-1$
+                "Pre-fill source: NOT_FILLUP | FROM_SOURCE_LANGUAGE | FROM_PROVIDER. Default: NOT_FILLUP.") //$NON-NLS-1$
             .stringProperty("providerId", //$NON-NLS-1$
-                "Translation provider ID, used only when fillUpType=FROM_PROVIDER " //$NON-NLS-1$
-              + "(e.g. \"com.e1c.langtool.history.externalTranslationProvider\"). " //$NON-NLS-1$
-              + "Use get_translation_project_info to list available providers.")
+                "Translation provider ID; required only when fillUpType=FROM_PROVIDER (see get_translation_project_info).") //$NON-NLS-1$
             .build();
     }
 
@@ -124,9 +116,10 @@ public class GenerateTranslationStringsTool implements IMcpTool
         String fillUpType = JsonUtils.extractStringArgument(params, "fillUpType"); //$NON-NLS-1$
         String providerId = JsonUtils.extractStringArgument(params, "providerId"); //$NON-NLS-1$
 
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return ToolResult.error("projectName is required").toJson(); //$NON-NLS-1$
+            return err;
         }
         if (targetLanguages == null || targetLanguages.isEmpty())
         {
@@ -150,24 +143,26 @@ public class GenerateTranslationStringsTool implements IMcpTool
         {
             // Resolve the IProject first so AI clients get the most specific
             // diagnostic ("Project not found" / "Project is closed") for bad
-            // names instead of the generic "Not an EDT project" message that
-            // ProjectStateChecker.checkReadyOrError returns for unknown
-            // projects.
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
-            IProject project = workspace.getRoot().getProject(projectName);
-            if (project == null || !project.exists())
+            // names. The readiness pre-check below refuses only the transient
+            // BUILDING state and returns null for a missing/closed/unknown
+            // project, so a bad name reaches these value-naming branches.
+            ProjectContext ctx = ProjectContext.of(projectName);
+            if (!ctx.exists())
             {
-                return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+                return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
             }
-            if (!project.isOpen())
+            if (!ctx.isOpen())
             {
                 return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
             }
+            IProject project = ctx.project();
 
-            String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-            if (notReadyError != null)
+            // Refuse only the transient BUILDING state; a missing/closed project
+            // falls through to the value-naming "Project not found" below.
+            String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+            if (building != null)
             {
-                return ToolResult.error(notReadyError).toJson();
+                return ToolResult.error(building).toJson();
             }
 
             // Reject dictionary storage projects, extensions and any

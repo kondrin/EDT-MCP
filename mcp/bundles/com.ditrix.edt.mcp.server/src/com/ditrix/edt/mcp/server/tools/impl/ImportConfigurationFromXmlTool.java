@@ -24,6 +24,7 @@ import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.FrontMatter;
 
 /**
  * Tool that wraps the EDT "Import → Configuration from XML Files" action.
@@ -49,10 +50,10 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Import a configuration from a directory of XML files into a new " //$NON-NLS-1$
-             + "EDT project (EDT menu: Import). The reverse of " //$NON-NLS-1$
-             + "export_configuration_to_xml. Wraps " //$NON-NLS-1$
-             + "IImportConfigurationFilesApi.importProject(Path, String, String, String)."; //$NON-NLS-1$
+        return "Import a configuration from a directory of XML files into a NEW EDT " //$NON-NLS-1$
+             + "project (EDT menu: Import); the reverse of export_configuration_to_xml. " //$NON-NLS-1$
+             + "The projectName must not already exist in the workspace. " //$NON-NLS-1$
+             + "Full parameters and examples: call get_tool_guide('import_configuration_from_xml')."; //$NON-NLS-1$
     }
 
     @Override
@@ -60,39 +61,36 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .stringProperty("importPath", //$NON-NLS-1$
-                "Filesystem path of the source directory containing XML files (required)", true) //$NON-NLS-1$
+                "Path of the source directory of XML files.", true) //$NON-NLS-1$
             .stringProperty("projectName", //$NON-NLS-1$
-                "Name of the new EDT project to create in the workspace (required)", true) //$NON-NLS-1$
+                "Name of the NEW EDT project to create (must not already exist).", true) //$NON-NLS-1$
             .stringProperty("projectNature", //$NON-NLS-1$
-                "EDT project nature ID, e.g. 'com._1c.g5.v8.dt.core.V8ConfigurationNature'. " //$NON-NLS-1$
-              + "Pass empty string to let EDT auto-detect.") //$NON-NLS-1$
+                "Optional EDT nature ID, e.g. 'com._1c.g5.v8.dt.core.V8ConfigurationNature'; empty = auto-detect.") //$NON-NLS-1$
             .stringProperty("xmlVersion", //$NON-NLS-1$
-                "XML format version, e.g. '8.3.20'. Pass empty string to let EDT auto-detect.") //$NON-NLS-1$
+                "Optional XML format version, e.g. '8.3.20'; empty = auto-detect.") //$NON-NLS-1$
             .build();
     }
 
     @Override
     public ResponseType getResponseType()
     {
-        return ResponseType.JSON;
+        return ResponseType.MARKDOWN;
     }
 
     @Override
     public String execute(Map<String, String> params)
     {
+        String err = JsonUtils.requireArguments(params, "importPath", "projectName"); //$NON-NLS-1$ //$NON-NLS-2$
+        if (err != null)
+        {
+            return err;
+        }
+
         String importPathStr = JsonUtils.extractStringArgument(params, "importPath"); //$NON-NLS-1$
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         String projectNature = JsonUtils.extractStringArgument(params, "projectNature"); //$NON-NLS-1$
         String xmlVersion = JsonUtils.extractStringArgument(params, "xmlVersion"); //$NON-NLS-1$
 
-        if (importPathStr == null || importPathStr.isEmpty())
-        {
-            return ToolResult.error("importPath is required").toJson(); //$NON-NLS-1$
-        }
-        if (projectName == null || projectName.isEmpty())
-        {
-            return ToolResult.error("projectName is required").toJson(); //$NON-NLS-1$
-        }
         // projectNature and xmlVersion are optional — pass null on empty
         if (projectNature != null && projectNature.isEmpty())
         {
@@ -112,6 +110,12 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
             // the AI agent gets a clear error instead of an opaque API
             // exception.
             Path importPath = Paths.get(importPathStr).toAbsolutePath().normalize();
+            boolean outsideWorkspace = isOutsideWorkspace(importPath);
+            if (outsideWorkspace)
+            {
+                Activator.logWarning("import_configuration_from_xml: importPath is OUTSIDE the EDT workspace: " //$NON-NLS-1$
+                    + importPath + " (trusted-caller-only — see README Security & trust model)."); //$NON-NLS-1$
+            }
             if (!Files.exists(importPath))
             {
                 return ToolResult.error(
@@ -128,7 +132,7 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
             // check the underlying EDT API still throws (with a less direct
             // message) and we'd surface it via the catch block — but a clean
             // up-front error is friendlier and matches the validation pattern
-            // used elsewhere (DeleteMetadataObjectTool, CleanProjectTool, etc.).
+            // used elsewhere (DeleteMetadataTool, CleanProjectTool, etc.).
             IWorkspace workspace = ResourcesPlugin.getWorkspace();
             IProject existing = workspace.getRoot().getProject(projectName);
             if (existing != null && existing.exists())
@@ -168,11 +172,32 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
                 created.refreshLocal(IResource.DEPTH_INFINITE, monitor);
             }
 
-            return ToolResult.success()
-                .put("importPath", importPath.toString()) //$NON-NLS-1$
+            // Action result: status + the source path and the created project name.
+            // There is no round-trip ID, machine-structured position, declared
+            // outputSchema, or UI-bound payload here, so MARKDOWN is the right format
+            // (see the "Response format policy" in README / edt-mcp-tool-conventions).
+            FrontMatter fm = FrontMatter.create()
+                .put("tool", NAME) //$NON-NLS-1$
+                .put("status", "success") //$NON-NLS-1$ //$NON-NLS-2$
                 .put("project", projectName) //$NON-NLS-1$
-                .put("message", "Configuration imported from XML files.") //$NON-NLS-1$ //$NON-NLS-2$
-                .toJson();
+                .put("importPath", importPath.toString()); //$NON-NLS-1$
+            if (outsideWorkspace)
+            {
+                fm.put("outsideWorkspace", true); //$NON-NLS-1$
+            }
+
+            StringBuilder body = new StringBuilder();
+            body.append("# Configuration imported from XML files\n\n"); //$NON-NLS-1$
+            body.append("- Project: ").append(projectName).append('\n'); //$NON-NLS-1$
+            body.append("- Import path: ").append(importPath).append('\n'); //$NON-NLS-1$
+            if (outsideWorkspace)
+            {
+                body.append('\n')
+                    .append("> Note: importPath is outside the EDT workspace; ") //$NON-NLS-1$
+                    .append("ensure the caller is trusted.\n"); //$NON-NLS-1$
+            }
+
+            return fm.wrapContent(body.toString());
         }
         catch (InvocationTargetException e)
         {
@@ -189,6 +214,31 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
         {
             Activator.logError("Unexpected error in import_configuration_from_xml", e); //$NON-NLS-1$
             return ToolResult.error(e.getMessage()).toJson();
+        }
+    }
+
+    /**
+     * Returns true if {@code path} is not under the Eclipse workspace root.
+     * Used to flag (not block) configuration imports from external locations.
+     * Deliberately fails OPEN (returns false on any uncertainty): this is an
+     * advisory-only check, so a false negative merely omits a warning and never
+     * rejects a legitimate import.
+     */
+    private static boolean isOutsideWorkspace(Path path)
+    {
+        try
+        {
+            org.eclipse.core.runtime.IPath loc = ResourcesPlugin.getWorkspace().getRoot().getLocation();
+            if (loc == null)
+            {
+                return false;
+            }
+            Path wsRoot = loc.toFile().toPath().toAbsolutePath().normalize();
+            return !path.startsWith(wsRoot);
+        }
+        catch (Exception e)
+        {
+            return false; // cannot determine — do not flag
         }
     }
 }

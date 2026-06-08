@@ -7,6 +7,7 @@
 package com.ditrix.edt.mcp.server.tools.impl;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -14,17 +15,16 @@ import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
-import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.emf.common.util.URI;
 
-import com._1c.g5.v8.bm.core.IBmTransaction;
 import com._1c.g5.v8.bm.integration.AbstractBmTask;
 import com._1c.g5.v8.bm.integration.IBmModel;
 import com._1c.g5.v8.dt.core.platform.IBmModelManager;
+import com._1c.g5.v8.dt.validation.marker.IExtraInfoMap;
 import com._1c.g5.v8.dt.validation.marker.IMarkerManager;
 import com._1c.g5.v8.dt.validation.marker.Marker;
 import com._1c.g5.v8.dt.validation.marker.MarkerSeverity;
+import com._1c.g5.v8.dt.validation.marker.StandardExtraInfo;
 import com.e1c.g5.v8.dt.check.settings.ICheckRepository;
 import com.e1c.g5.v8.dt.check.settings.CheckUid;
 
@@ -34,13 +34,13 @@ import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.BmTransactions;
+import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
 import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
 import com.ditrix.edt.mcp.server.utils.MetadataTypeUtils;
+import com.ditrix.edt.mcp.server.utils.Pagination;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonParser;
 
 /**
  * Tool to get detailed project errors with optional filters.
@@ -57,7 +57,11 @@ import com.google.gson.JsonParser;
 public class GetProjectErrorsTool implements IMcpTool
 {
     public static final String NAME = "get_project_errors"; //$NON-NLS-1$
-    
+
+    /** Closed set of severity filter values accepted by the {@code severity} parameter. */
+    static final List<String> SEVERITY_VALUES =
+        Arrays.asList("ERRORS", "BLOCKER", "CRITICAL", "MAJOR", "MINOR", "TRIVIAL", "NONE"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$ //$NON-NLS-7$
+
     @Override
     public String getName()
     {
@@ -67,88 +71,75 @@ public class GetProjectErrorsTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Get detailed configuration problems from EDT. " + //$NON-NLS-1$
-               "Returns check code, description, object location, severity level (ERRORS, BLOCKER, CRITICAL, MAJOR, MINOR, TRIVIAL). " + //$NON-NLS-1$
-               "Can filter by specific objects using FQN (e.g. 'Document.SalesOrder', 'Catalog.Products'). " + //$NON-NLS-1$
-               "Russian type names are also supported (e.g. 'Документ.ПриходнаяНакладная', 'Справочник.Номенклатура')."; //$NON-NLS-1$
+        return "List EDT configuration problems (validation markers) with optional project / severity / check-id / object filters. " + //$NON-NLS-1$
+               "Each row carries the check code, message, object location and severity; BSL-module problems also expose a structural locator (Module path + Line) you can feed straight into read_module_source or set_breakpoint. " + //$NON-NLS-1$
+               "Object FQN filters accept English or Russian type names (e.g. 'Catalog.Products'). " + //$NON-NLS-1$
+               "Use this for the detailed marker list; for severity totals only call get_problem_summary. " + //$NON-NLS-1$
+               "Full parameters and examples: call get_tool_guide('get_project_errors')."; //$NON-NLS-1$
     }
     
     @Override
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", "Filter by project name (optional)") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("severity", "Filter by severity: ERRORS, BLOCKER, CRITICAL, MAJOR, MINOR, TRIVIAL (optional)") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("checkId", "Filter by check ID substring. Matches either the symbolic check id (e.g. 'ql-temp-table-index') or the short UID (e.g. 'SU23') (optional)") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringArrayProperty("objects", "Filter by object FQNs (e.g. ['Document.SalesOrder', 'Catalog.Products']). Russian type names supported (e.g. 'Документ.ПродажаТоваров'). Returns errors only from these objects.") //$NON-NLS-1$ //$NON-NLS-2$
-            .integerProperty("limit", "Maximum number of results (default: 100, max: 1000)") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("projectName", "Filter by EDT project name; omit to scan all projects (optional)") //$NON-NLS-1$ //$NON-NLS-2$
+            .enumProperty("severity", "Filter by severity (optional)", //$NON-NLS-1$ //$NON-NLS-2$
+                "ERRORS", "BLOCKER", "CRITICAL", "MAJOR", "MINOR", "TRIVIAL", "NONE") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$ //$NON-NLS-7$
+            .stringProperty("checkId", "Filter by check-id substring; matches the symbolic id (e.g. 'ql-temp-table-index') or short UID (e.g. 'SU23') (optional)") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringArrayProperty("objects", "Filter by object FQNs, e.g. ['Catalog.Products']; English or Russian type names accepted (optional)") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("limit", "Max results; default 100, max 1000 (optional)") //$NON-NLS-1$ //$NON-NLS-2$
+            .enumProperty("responseFormat", //$NON-NLS-1$
+                "Output verbosity (optional): concise (default) = leaner table without the secondary 'Has docs' column; detailed = full table including 'Has docs'", //$NON-NLS-1$
+                "concise", "detailed") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
-    
+
     @Override
     public String execute(Map<String, String> params)
     {
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         String severity = JsonUtils.extractStringArgument(params, "severity"); //$NON-NLS-1$
         String checkId = JsonUtils.extractStringArgument(params, "checkId"); //$NON-NLS-1$
-        String objectsJson = JsonUtils.extractStringArgument(params, "objects"); //$NON-NLS-1$
-        
-        // Check if project is ready for operations
-        if (projectName != null && !projectName.isEmpty())
+
+        // Output verbosity: concise (default) trims the secondary 'Has docs' column;
+        // detailed renders the full historical table. Any absent/blank/unrecognized value
+        // falls back to concise (the lean default), never an error.
+        String responseFormat = JsonUtils.extractStringArgument(params, "responseFormat"); //$NON-NLS-1$
+        boolean detailed = responseFormat != null && responseFormat.equalsIgnoreCase("detailed"); //$NON-NLS-1$
+
+        // Reject an out-of-set severity instead of silently widening the filter to "all".
+        if (severity != null && !severity.isEmpty()
+            && !SEVERITY_VALUES.contains(severity.toUpperCase()))
         {
-            String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-            if (notReadyError != null)
-            {
-                return ToolResult.error(notReadyError).toJson();
-            }
+            return ToolResult.error("Invalid severity: '" + severity + "'. Must be one of: " //$NON-NLS-1$ //$NON-NLS-2$
+                + String.join(", ", SEVERITY_VALUES)).toJson(); //$NON-NLS-1$
+        }
+
+        // Refuse only the transient BUILDING state (buildingErrorOrNull skips a
+        // null/empty name itself); a missing/closed project falls through to the
+        // value-naming "Project not found: <name>" in getProjectErrors instead of a
+        // misleading "Project does not exist. Please wait and retry."
+        String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+        if (building != null)
+        {
+            return ToolResult.error(building).toJson();
         }
         
-        // Parse objects filter
-        List<String> objects = parseObjectsList(objectsJson);
-        
+        // Objects filter: accepts a JSON array (["Catalog.Products"]) or a
+        // comma-separated string, via the shared extractArrayArgument helper.
+        List<String> objects = JsonUtils.extractArrayArgument(params, "objects"); //$NON-NLS-1$
+        if (objects == null)
+        {
+            objects = new ArrayList<>();
+        }
+
         int defaultLimit = ToolParameterSettings.getInstance()
             .getParameterValue(NAME, "limit", 100); //$NON-NLS-1$
 
         int limit = JsonUtils.extractIntArgument(params, "limit", defaultLimit); //$NON-NLS-1$
-        limit = Math.min(Math.max(1, limit), 1000);
-        
-        return getProjectErrors(projectName, severity, checkId, objects, limit);
-    }
-    
-    /**
-     * Parses the objects array from JSON string using Gson JsonParser.
-     * 
-     * @param objectsJson JSON array string like ["Document.SalesOrder", "Catalog.Products"]
-     * @return list of object FQNs
-     */
-    private List<String> parseObjectsList(String objectsJson)
-    {
-        List<String> result = new ArrayList<>();
-        if (objectsJson == null || objectsJson.isEmpty())
-        {
-            return result;
-        }
-        
-        try
-        {
-            JsonElement element = JsonParser.parseString(objectsJson);
-            if (element.isJsonArray())
-            {
-                JsonArray array = element.getAsJsonArray();
-                for (JsonElement item : array)
-                {
-                    if (item.isJsonPrimitive() && item.getAsJsonPrimitive().isString())
-                    {
-                        result.add(item.getAsString());
-                    }
-                }
-            }
-        }
-        catch (JsonParseException e)
-        {
-            Activator.logError("Error parsing objects JSON: " + objectsJson, e); //$NON-NLS-1$
-        }
-        return result;
+        limit = Pagination.clampLimit(limit, 1000);
+
+        return getProjectErrors(projectName, severity, checkId, objects, limit, detailed);
     }
     
     /**
@@ -159,9 +150,13 @@ public class GetProjectErrorsTool implements IMcpTool
      * @param checkId filter by check ID substring
      * @param objects filter by object FQNs (empty list for all objects)
      * @param limit maximum number of results
+     * @param detailed when {@code true} render the full table (incl. the secondary
+     *        {@code Has docs} column); when {@code false} (the default) render a leaner
+     *        table that omits {@code Has docs}. Only the table presentation changes — the
+     *        marker collection, model reads and transaction boundaries are identical.
      * @return Markdown formatted string with error details
      */
-    public static String getProjectErrors(String projectName, String severity, String checkId, List<String> objects, int limit)
+    public static String getProjectErrors(String projectName, String severity, String checkId, List<String> objects, int limit, boolean detailed)
     {
         try
         {
@@ -169,14 +164,12 @@ public class GetProjectErrorsTool implements IMcpTool
             
             if (markerManager == null)
             {
-                return "# Error\n\nIMarkerManager service is not available"; //$NON-NLS-1$
+                return ToolResult.error("IMarkerManager service is not available").toJson(); //$NON-NLS-1$
             }
             
             final ICheckRepository checkRepository = Activator.getDefault().getCheckRepository();
             IBmModelManager bmModelManager = Activator.getDefault().getBmModelManager();
-            
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
-            
+
             // Parse severity filter
             MarkerSeverity severityFilter = null;
             if (severity != null && !severity.isEmpty())
@@ -196,10 +189,10 @@ public class GetProjectErrorsTool implements IMcpTool
             // Validate project if specified
             if (projectName != null && !projectName.isEmpty())
             {
-                IProject project = workspace.getRoot().getProject(projectName);
-                if (project == null || !project.exists())
+                ProjectContext ctx = ProjectContext.of(projectName);
+                if (!ctx.exists())
                 {
-                    return "# Error\n\nProject not found: " + projectName; //$NON-NLS-1$
+                    return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
                 }
             }
             
@@ -259,7 +252,7 @@ public class GetProjectErrorsTool implements IMcpTool
                 // Resolve the project's BM model so getObjectPresentation() can lazily
                 // resolve the marker target inside a read transaction. The getModel(IProject)
                 // overload is the idiomatic path used across the plugin (FindReferencesTool,
-                // AddMetadataAttributeTool, tag tools), so no IDtProjectManager is needed.
+                // CreateMetadataTool, tag tools), so no IDtProjectManager is needed.
                 IBmModel bmModel = bmModelManager != null ? bmModelManager.getModel(entry.getKey()) : null;
                 
                 Runnable collector = () -> projectMarkers.stream()
@@ -271,14 +264,9 @@ public class GetProjectErrorsTool implements IMcpTool
                 
                 if (bmModel != null)
                 {
-                    bmModel.executeReadonlyTask(new AbstractBmTask<Void>("CollectProjectErrors") //$NON-NLS-1$
-                    {
-                        @Override
-                        public Void execute(IBmTransaction transaction, IProgressMonitor monitor)
-                        {
-                            collector.run();
-                            return null;
-                        }
+                    BmTransactions.<Void>read(bmModel, "CollectProjectErrors", (tx, pm) -> { //$NON-NLS-1$
+                        collector.run();
+                        return null;
                     });
                 }
                 else
@@ -315,27 +303,51 @@ public class GetProjectErrorsTool implements IMcpTool
                 md.append("**Found:** ").append(errors.size()); //$NON-NLS-1$
                 if (errors.size() >= limit)
                 {
-                    md.append("+ (limited to ").append(limit).append(")"); //$NON-NLS-1$ //$NON-NLS-2$
+                    md.append(Pagination.limitReachedNotice(limit));
                 }
                 md.append("\n\n"); //$NON-NLS-1$
                 
-                // Build table matching EDT's Configuration Problems view
-                md.append("| Description | Location | Check code | Has docs |\n"); //$NON-NLS-1$
-                md.append("|-------------|----------|------------|----------|\n"); //$NON-NLS-1$
-                
+                // Build table matching EDT's Configuration Problems view, plus a structural
+                // locator (Module path + Line) that feeds read_module_source / set_breakpoint.
+                // Built via the shared MarkdownUtils table builder so every cell is escaped.
+                // concise (default) drops the secondary 'Has docs' column to save tokens;
+                // detailed keeps the full historical set of columns. Every essential /
+                // actionable column (Description, Location, Module path, Line, Check code)
+                // is present in BOTH modes.
+                if (detailed)
+                {
+                    md.append(MarkdownUtils.tableHeader("Description", "Location", //$NON-NLS-1$ //$NON-NLS-2$
+                        "Module path", "Line", "Check code", "Has docs")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                }
+                else
+                {
+                    md.append(MarkdownUtils.tableHeader("Description", "Location", //$NON-NLS-1$ //$NON-NLS-2$
+                        "Module path", "Line", "Check code")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                }
+
                 for (ErrorInfo error : errors)
                 {
-                    md.append("| ").append(MarkdownUtils.escapeForTable(error.message)); //$NON-NLS-1$
-                    md.append(" | ").append(MarkdownUtils.escapeForTable(error.objectPresentation)); //$NON-NLS-1$
-                    
                     // Show symbolic check ID if available, otherwise show check code
-                    String displayCheckId = error.checkId != null && !error.checkId.isEmpty() 
-                        ? error.checkId 
+                    String displayCheckId = error.checkId != null && !error.checkId.isEmpty()
+                        ? error.checkId
                         : error.checkCode;
-                    md.append(" | `").append(displayCheckId).append("`"); //$NON-NLS-1$ //$NON-NLS-2$
-                    
-                    // Add documentation availability flag
-                    md.append(" | ").append(error.hasDocumentation ? "true" : "false").append(" |\n"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                    // Wrap the check code in backticks; tableRow escapes the cell, so do NOT
+                    // pre-escape here (double-escaping would mangle a pipe in the id).
+                    String checkCell = "`" + (displayCheckId != null ? displayCheckId : "") + "`"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                    String modulePathCell = error.modulePath != null ? error.modulePath : ""; //$NON-NLS-1$
+                    String lineCell = error.line != null ? error.line.toString() : ""; //$NON-NLS-1$
+
+                    if (detailed)
+                    {
+                        md.append(MarkdownUtils.tableRow(error.message, error.objectPresentation,
+                            modulePathCell, lineCell, checkCell,
+                            error.hasDocumentation ? "true" : "false")); //$NON-NLS-1$ //$NON-NLS-2$
+                    }
+                    else
+                    {
+                        md.append(MarkdownUtils.tableRow(error.message, error.objectPresentation,
+                            modulePathCell, lineCell, checkCell));
+                    }
                 }
             }
             
@@ -359,7 +371,7 @@ public class GetProjectErrorsTool implements IMcpTool
         catch (Exception e)
         {
             Activator.logError("Error getting project errors", e); //$NON-NLS-1$
-            return "# Error\n\nFailed to get project errors: " + e.getMessage(); //$NON-NLS-1$
+            return ToolResult.error("Failed to get project errors: " + e.getMessage()).toJson(); //$NON-NLS-1$
         }
     }
     
@@ -448,6 +460,12 @@ public class GetProjectErrorsTool implements IMcpTool
         error.hasDocumentation = symbolicCheckId != null && !symbolicCheckId.isEmpty()
             && GetCheckDescriptionTool.hasCheckDocumentation(symbolicCheckId);
         error.message = marker.getMessage() != null ? marker.getMessage() : ""; //$NON-NLS-1$
+
+        // Structural locator: for a marker that points at a BSL text position the
+        // module path + 1-based line live in the marker's own extraInfo map (no model
+        // read), so they are safe to read regardless of the transaction boundary. Both
+        // stay null for markers that do not resolve to a BSL module location.
+        populateModuleLocation(marker, error);
         if (presentationResolved)
         {
             error.objectPresentation = objectPresentation;
@@ -513,6 +531,98 @@ public class GetProjectErrorsTool implements IMcpTool
     }
     
     /**
+     * Populates the structural BSL locator ({@code modulePath} + {@code line}) on the
+     * {@link ErrorInfo} when the marker points at a position inside a BSL module, leaving
+     * both {@code null} otherwise.
+     *
+     * <p>The locator is read straight from the marker's {@link Marker#getExtraInfo()} map —
+     * {@link StandardExtraInfo#TEXT_URI_TO_PROBLEM} (the EMF platform URI of the problem) and
+     * {@link StandardExtraInfo#TEXT_LINE} (1-based line). EDT fills these for text/Xtext
+     * issues (e.g. BSL editor markers; see {@code BmAwareResourceValidatorListener}). Because
+     * the values are plain strings already stored on the marker, reading them touches NO
+     * model state and is therefore safe with respect to the BM read-transaction boundary.</p>
+     *
+     * <p>The module path is only set when the URI genuinely resolves to a {@code .bsl} module
+     * under the source folder, so it matches the {@code modulePath} shape accepted by
+     * {@code read_module_source} / {@code set_breakpoint}. The line is only set when the path
+     * is set, so a caller never gets a line without a module to apply it to.</p>
+     */
+    static void populateModuleLocation(Marker marker, ErrorInfo error)
+    {
+        IExtraInfoMap extraInfo = marker.getExtraInfo();
+        if (extraInfo == null)
+        {
+            return;
+        }
+
+        String uriToProblem = extraInfo.get(StandardExtraInfo.TEXT_URI_TO_PROBLEM);
+        String modulePath = resolveBslModulePath(uriToProblem);
+        if (modulePath == null)
+        {
+            // No BSL module location: leave both null rather than inventing a path.
+            return;
+        }
+        error.modulePath = modulePath;
+
+        Integer line = extraInfo.get(StandardExtraInfo.TEXT_LINE);
+        if (line != null && line.intValue() >= 1)
+        {
+            error.line = line;
+        }
+    }
+
+    /**
+     * Derives a source-folder-relative BSL module path (the shape
+     * {@code read_module_source} / {@code set_breakpoint} accept, e.g.
+     * {@code "CommonModules/MyModule/Module.bsl"}) from an EMF problem URI string, or
+     * {@code null} when the URI is absent, unparseable, or does not point at a {@code .bsl}
+     * module under the source folder.
+     *
+     * <p>The URI is a platform resource URI like
+     * {@code platform:/resource/<Project>/src/<modulePath>.bsl#<fragment>}. The fragment is
+     * trimmed and the {@code <Project>/src/} prefix is stripped via
+     * {@link BslModuleUtils#extractModulePath(String)} (the single source of truth for the
+     * {@code /src/} assumption). A URI whose platform path contains no {@code /src/} segment,
+     * or whose file extension is not {@code bsl}, yields {@code null} — never a guessed path.</p>
+     */
+    static String resolveBslModulePath(String uriToProblem)
+    {
+        if (uriToProblem == null || uriToProblem.isEmpty())
+        {
+            return null;
+        }
+        try
+        {
+            URI uri = URI.createURI(uriToProblem).trimFragment();
+            // Only BSL module problems carry a path read_module_source/set_breakpoint can use.
+            if (!"bsl".equalsIgnoreCase(uri.fileExtension())) //$NON-NLS-1$
+            {
+                return null;
+            }
+            // platform:/resource/<Project>/src/<modulePath>.bsl -> <Project>/src/<modulePath>.bsl
+            String platformString = uri.isPlatformResource() ? uri.toPlatformString(true) : null;
+            if (platformString == null || platformString.isEmpty())
+            {
+                return null;
+            }
+            // extractModulePath returns the part after "/src/"; require the segment to be
+            // present so we never hand back a project-relative or unrelated path.
+            String marker = "/" + BslModuleUtils.SOURCE_FOLDER + "/"; //$NON-NLS-1$ //$NON-NLS-2$
+            if (!platformString.contains(marker))
+            {
+                return null;
+            }
+            String modulePath = BslModuleUtils.extractModulePath(platformString);
+            return modulePath != null && !modulePath.isEmpty() ? modulePath : null;
+        }
+        catch (Exception e)
+        {
+            // A malformed URI is not actionable as a locator; fall back to no location.
+            return null;
+        }
+    }
+
+    /**
      * Helper class to store error info.
      */
     static class ErrorInfo
@@ -522,5 +632,7 @@ public class GetProjectErrorsTool implements IMcpTool
         String message;
         String objectPresentation;
         boolean hasDocumentation;  // Whether documentation exists for this check
+        String modulePath;         // Source-folder-relative BSL module path, or null
+        Integer line;              // 1-based line inside the module, or null
     }
 }

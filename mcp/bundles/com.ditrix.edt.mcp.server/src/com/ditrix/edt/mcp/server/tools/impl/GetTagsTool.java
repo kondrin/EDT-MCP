@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Map;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
 
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
@@ -20,6 +19,8 @@ import com.ditrix.edt.mcp.server.tags.TagService;
 import com.ditrix.edt.mcp.server.tags.model.Tag;
 import com.ditrix.edt.mcp.server.tags.model.TagStorage;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
+import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 
 /**
@@ -58,25 +59,30 @@ public class GetTagsTool implements IMcpTool
     public String execute(Map<String, String> params)
     {
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
-        
-        if (projectName == null || projectName.isEmpty())
+
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return ToolResult.error("Project name is required").toJson(); //$NON-NLS-1$
+            return err;
         }
         
-        // Check if project is ready for operations
-        String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-        if (notReadyError != null)
+        // Refuse only the transient BUILDING state; a missing/closed project falls
+        // through to the value-naming "Project not found: <name>" below instead of a
+        // misleading "Project does not exist. Please wait and retry." (a retry never
+        // resolves a genuinely missing project).
+        String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+        if (building != null)
         {
-            return ToolResult.error(notReadyError).toJson();
+            return ToolResult.error(building).toJson();
         }
         
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
-        
+        IProject project = ctx.project();
+
         try
         {
             return getTags(project);
@@ -107,9 +113,10 @@ public class GetTagsTool implements IMcpTool
         
         StringBuilder sb = new StringBuilder();
         sb.append("# Tags in project: ").append(project.getName()).append("\n\n"); //$NON-NLS-1$ //$NON-NLS-2$
-        sb.append("| # | Name | Color | Description | Objects |\n"); //$NON-NLS-1$
-        sb.append("|---|------|-------|-------------|--------|\n"); //$NON-NLS-1$
-        
+        // Cells are escaped by MarkdownUtils.tableRow, so tag names/colors/
+        // descriptions containing '|' can no longer break the table.
+        sb.append(MarkdownUtils.tableHeader("#", "Name", "Color", "Description", "Objects")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$
+
         int index = 1;
         for (Tag tag : tags)
         {
@@ -119,21 +126,17 @@ public class GetTagsTool implements IMcpTool
             {
                 description = "-"; //$NON-NLS-1$
             }
-            else
-            {
-                // Escape pipe characters for markdown table
-                description = description.replace("|", "\\|"); //$NON-NLS-1$ //$NON-NLS-2$
-            }
-            
-            sb.append("| ").append(index++).append(" | "); //$NON-NLS-1$ //$NON-NLS-2$
-            sb.append(tag.getName()).append(" | "); //$NON-NLS-1$
-            sb.append(tag.getColor()).append(" | "); //$NON-NLS-1$
-            sb.append(description).append(" | "); //$NON-NLS-1$
-            sb.append(objectCount).append(" |\n"); //$NON-NLS-1$
+
+            sb.append(MarkdownUtils.tableRow(
+                String.valueOf(index++),
+                tag.getName(),
+                tag.getColor(),
+                description,
+                String.valueOf(objectCount)));
         }
-        
+
         sb.append("\n**Total tags:** ").append(tags.size()); //$NON-NLS-1$
-        
+
         return sb.toString();
     }
     

@@ -22,11 +22,12 @@ public enum ToolGroup
         "Essential project, configuration, and XML export/import tools", //$NON-NLS-1$
         "get_edt_version", "list_projects", "get_configuration_properties", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         "clean_project", "revalidate_objects", "get_check_description", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-        "export_configuration_to_xml", "import_configuration_from_xml"), //$NON-NLS-1$ //$NON-NLS-2$
+        "export_configuration_to_xml", "import_configuration_from_xml", //$NON-NLS-1$ //$NON-NLS-2$
+        "delete_project"), //$NON-NLS-1$
 
     PROBLEMS("problems", "Errors & Problems", //$NON-NLS-1$ //$NON-NLS-2$
-        "Error reporting, bookmarks, and tasks", //$NON-NLS-1$
-        "get_problem_summary", "get_project_errors", "get_bookmarks", "get_tasks"), //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+        "Error reporting and workspace markers (bookmarks, tasks)", //$NON-NLS-1$
+        "get_problem_summary", "get_project_errors", "get_markers"), //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
 
     CODE_INTELLIGENCE("codeIntelligence", "Code Intelligence", //$NON-NLS-1$ //$NON-NLS-2$
         "Content assist, documentation, metadata browsing, and references", //$NON-NLS-1$
@@ -56,9 +57,9 @@ public enum ToolGroup
         "get_form_screenshot", "validate_query"), //$NON-NLS-1$ //$NON-NLS-2$
 
     REFACTORING("refactoring", "Refactoring", //$NON-NLS-1$ //$NON-NLS-2$
-        "Metadata create, rename, delete, and attribute management", //$NON-NLS-1$
-        "rename_metadata_object", "delete_metadata_object", "add_metadata_attribute", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-        "create_metadata_object"), //$NON-NLS-1$
+        "Metadata create, rename, delete and property management (objects, members and form members)", //$NON-NLS-1$
+        "rename_metadata_object", "delete_metadata", "create_metadata", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        "modify_metadata"), //$NON-NLS-1$
 
     TRANSLATION("translation", "Translation (LanguageTool)", //$NON-NLS-1$ //$NON-NLS-2$
         "LanguageTool: translation strings generation, configuration sync, project info", //$NON-NLS-1$

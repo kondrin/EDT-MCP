@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.eclipse.core.resources.IMarker;
+import org.eclipse.core.resources.IProject;
 import org.eclipse.debug.core.DebugPlugin;
 import org.eclipse.debug.core.IBreakpointManager;
 import org.eclipse.debug.core.model.IBreakpoint;
@@ -50,6 +51,16 @@ public class ListBreakpointsTool implements IMcpTool
     }
 
     @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .objectArrayProperty("breakpoints", "List of active line breakpoints") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("count", "Number of breakpoints returned") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
+    @Override
     public ResponseType getResponseType()
     {
         return ResponseType.JSON;
@@ -75,14 +86,21 @@ public class ListBreakpointsTool implements IMcpTool
             {
                 continue;
             }
+            // IResource.getProject() is null for a marker on the workspace root —
+            // skip such markers to avoid an NPE on getName() below.
+            IProject project = m.getResource().getProject();
+            if (project == null)
+            {
+                continue;
+            }
             if (projectFilter != null && !projectFilter.isEmpty()
-                && !projectFilter.equals(m.getResource().getProject().getName()))
+                && !projectFilter.equals(project.getName()))
             {
                 continue;
             }
             Map<String, Object> dto = new LinkedHashMap<>();
             dto.put("breakpointId", m.getId()); //$NON-NLS-1$
-            dto.put("project", m.getResource().getProject().getName()); //$NON-NLS-1$
+            dto.put("project", project.getName()); //$NON-NLS-1$
             dto.put("file", m.getResource().getFullPath().toString()); //$NON-NLS-1$
             try
             {

@@ -55,24 +55,33 @@ public class ListConfigurationsTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "List EDT launch configurations (runtime client + Attach + other 1C types) " //$NON-NLS-1$
-            + "with their current running state. Each entry carries the configuration name " //$NON-NLS-1$
-            + "(use it as launchConfigurationName in debug_launch / run_yaxunit_tests / " //$NON-NLS-1$
-            + "debug_yaxunit_tests / update_database), type id, attach flag, applicationId " //$NON-NLS-1$
-            + "(real or synthetic 'attach:<name>'), project, infobase alias, debug server URL, " //$NON-NLS-1$
-            + "and a 'running' flag (plus 'suspended' when the session is paused on a breakpoint). " //$NON-NLS-1$
-            + "Use type='attach' for server-side debug setups (HTTP services, background jobs), " //$NON-NLS-1$
-            + "type='client' for 1C:Enterprise client configs, or type='all' (default)."; //$NON-NLS-1$
+        return "List EDT launch configurations (runtime client + Attach + other 1C types) with " //$NON-NLS-1$
+            + "their running state. This is the discovery step before debug_launch / " //$NON-NLS-1$
+            + "run_yaxunit_tests / debug_yaxunit_tests / update_database: use the returned 'name' " //$NON-NLS-1$
+            + "as their launchConfigurationName. Use type='attach' for server-side debug setups, " //$NON-NLS-1$
+            + "type='client' for 1C:Enterprise client configs, or type='all' (default). " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('list_configurations')."; //$NON-NLS-1$
     }
 
     @Override
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("type", //$NON-NLS-1$
-                "Filter: 'attach' (RemoteRuntime + LocalRuntime), 'client' (RuntimeClient), " //$NON-NLS-1$
-                    + "or 'all' (default — any 1C/EDT launch config)") //$NON-NLS-1$
-            .stringProperty("projectName", "Optional project name filter") //$NON-NLS-1$ //$NON-NLS-2$
+            .enumProperty("type", //$NON-NLS-1$
+                "Filter by config kind; default 'all'. e.g. 'attach' for server-side debug.", //$NON-NLS-1$
+                "attach", "client", "all") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            .stringProperty("projectName", "Optional exact project-name filter.") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .objectArrayProperty("configurations", //$NON-NLS-1$
+                "Matching launch configurations with their state.") //$NON-NLS-1$
+            .integerProperty("count", "Number of configurations returned.") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
 
@@ -87,6 +96,14 @@ public class ListConfigurationsTool implements IMcpTool
     {
         String typeFilter = JsonUtils.extractStringArgument(params, "type"); //$NON-NLS-1$
         String projectFilter = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+
+        // Reject an out-of-set type instead of silently treating it as 'all' (the
+        // schema declares the enum; honour it at runtime too).
+        if (typeFilter != null && !typeFilter.isEmpty() && !isKnownTypeFilter(typeFilter))
+        {
+            return ToolResult.error("Invalid type: '" + typeFilter //$NON-NLS-1$
+                + "'. Must be one of: all, attach, client.").toJson(); //$NON-NLS-1$
+        }
 
         try
         {
@@ -165,8 +182,21 @@ public class ListConfigurationsTool implements IMcpTool
         catch (Exception e)
         {
             Activator.logError("Error in list_configurations", e); //$NON-NLS-1$
-            return ToolResult.error("Error: " + e.getMessage()).toJson(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson(); //$NON-NLS-1$
         }
+    }
+
+    /**
+     * Whether {@code filter} is an accepted type token. {@code all}/{@code attach}/
+     * {@code client} are the schema enum; {@code runtime}/{@code runtimeClient} are
+     * tolerated aliases of {@code client}. A genuinely-unknown value is rejected in
+     * {@link #execute} before the listing loop runs.
+     */
+    private static boolean isKnownTypeFilter(String filter)
+    {
+        return "all".equalsIgnoreCase(filter) || "attach".equalsIgnoreCase(filter) //$NON-NLS-1$ //$NON-NLS-2$
+            || "client".equalsIgnoreCase(filter) || "runtime".equalsIgnoreCase(filter) //$NON-NLS-1$ //$NON-NLS-2$
+            || "runtimeClient".equalsIgnoreCase(filter); //$NON-NLS-1$
     }
 
     private static boolean matchesTypeFilter(String filter, boolean isAttach, boolean isClient)
@@ -184,7 +214,8 @@ public class ListConfigurationsTool implements IMcpTool
         {
             return isClient;
         }
-        // Unknown filter — be permissive.
+        // Unreachable for unknown values: execute() rejects them upstream via
+        // isKnownTypeFilter. Kept as a defensive default.
         return true;
     }
 

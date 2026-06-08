@@ -1,4 +1,4 @@
-﻿/**
+/**
  * MCP Server for EDT
  * Copyright (C) 2025 DitriX (https://github.com/DitriXNew)
  * Licensed under AGPL-3.0-or-later
@@ -18,7 +18,6 @@ import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.IResourceVisitor;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
 
 import com.ditrix.edt.mcp.server.Activator;
@@ -26,7 +25,12 @@ import com.ditrix.edt.mcp.server.preferences.ToolParameterSettings;
 
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
+import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
+import com.ditrix.edt.mcp.server.utils.Pagination;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool for full-text search across all BSL modules in a project.
@@ -56,10 +60,13 @@ public class SearchInCodeTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Full-text search across all BSL modules in a project. " + //$NON-NLS-1$
-               "Supports plain text and regex patterns, case sensitivity, " + //$NON-NLS-1$
-               "context lines around matches, and file path filtering. " + //$NON-NLS-1$
-               "Use outputMode 'count' or 'files' for lightweight queries before full search."; //$NON-NLS-1$
+        return "Literal/regex full-text search across all BSL modules in a project. " + //$NON-NLS-1$
+               "Matching is purely textual and NOT ru/en dialect-aware, so a query in one " + //$NON-NLS-1$
+               "BSL language won't find the other spelling; for identifier lookup use " + //$NON-NLS-1$
+               "get_symbol_info, find_references or get_method_call_hierarchy instead. " + //$NON-NLS-1$
+               "Use this for a literal text scan; for a symbol's USAGES use find_references, " + //$NON-NLS-1$
+               "for where it is DEFINED use go_to_definition. " + //$NON-NLS-1$
+               "Full parameters and examples: call get_tool_guide('search_in_code')."; //$NON-NLS-1$
     }
 
     @Override
@@ -69,27 +76,25 @@ public class SearchInCodeTool implements IMcpTool
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringProperty("query", //$NON-NLS-1$
-                "Search string or regex pattern (required)", true) //$NON-NLS-1$
+                "Search string or regex pattern (required); matched literally unless isRegex=true", true) //$NON-NLS-1$
             .booleanProperty("caseSensitive", //$NON-NLS-1$
                 "Case-sensitive search. Default: false") //$NON-NLS-1$
             .booleanProperty("isRegex", //$NON-NLS-1$
-                "Treat query as regular expression. Default: false") //$NON-NLS-1$
+                "Treat query as a regular expression. Default: false") //$NON-NLS-1$
+            .integerProperty("limit", //$NON-NLS-1$
+                "Max matches returned with context. Default: 100, max: 500") //$NON-NLS-1$
             .integerProperty("maxResults", //$NON-NLS-1$
-                "Maximum number of matches to return with context. Default: 100, max: 500") //$NON-NLS-1$
+                "Deprecated alias for 'limit'. Default: 100, max: 500") //$NON-NLS-1$
             .integerProperty("contextLines", //$NON-NLS-1$
                 "Lines of context before/after each match. Default: 2, max: 5") //$NON-NLS-1$
             .stringProperty("fileMask", //$NON-NLS-1$
                 "Filter by module path substring (e.g. 'CommonModules' or 'Documents/SalesOrder')") //$NON-NLS-1$
             .stringProperty("metadataType", //$NON-NLS-1$
-                "Filter by metadata type: 'documents', 'catalogs', 'commonModules', " + //$NON-NLS-1$
-                "'informationRegisters', 'accumulationRegisters', 'reports', 'dataProcessors', " + //$NON-NLS-1$
-                "'exchangePlans', 'businessProcesses', 'tasks', 'constants', " + //$NON-NLS-1$
-                "'commonCommands', 'commonForms', 'webServices', 'httpServices'. " + //$NON-NLS-1$
-                "More precise than fileMask.") //$NON-NLS-1$
-            .stringProperty("outputMode", //$NON-NLS-1$
-                "Output mode: 'full' (matches with context, default), " + //$NON-NLS-1$
-                "'count' (only total count, fast), " + //$NON-NLS-1$
-                "'files' (file list with match counts, no context)") //$NON-NLS-1$
+                "Filter by metadata type (e.g. 'documents', 'catalogs', 'commonModules'); " + //$NON-NLS-1$
+                "more precise than fileMask. See guide for the full list.") //$NON-NLS-1$
+            .enumProperty("outputMode", //$NON-NLS-1$
+                "Output mode: 'full' (matches with context, default), 'count', or 'files'", //$NON-NLS-1$
+                "full", "count", "files") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             .build();
     }
 
@@ -127,20 +132,20 @@ public class SearchInCodeTool implements IMcpTool
             .getParameterValue(NAME, "maxResults", DEFAULT_MAX_RESULTS); //$NON-NLS-1$
         int configuredContextLines = ToolParameterSettings.getInstance()
             .getParameterValue(NAME, "contextLines", DEFAULT_CONTEXT_LINES); //$NON-NLS-1$
-        int maxResults = JsonUtils.extractIntArgument(params, "maxResults", configuredMaxResults); //$NON-NLS-1$
+        // Canonical param is "limit" (consistent with other paginated tools);
+        // "maxResults" is kept as a deprecated alias (precedence: limit, then maxResults).
+        int maxResultsAlias = JsonUtils.extractIntArgument(params, "maxResults", configuredMaxResults); //$NON-NLS-1$
+        int maxResults = JsonUtils.extractIntArgument(params, "limit", maxResultsAlias); //$NON-NLS-1$
         int contextLines = JsonUtils.extractIntArgument(params, "contextLines", configuredContextLines); //$NON-NLS-1$
         String fileMask = JsonUtils.extractStringArgument(params, "fileMask"); //$NON-NLS-1$
         String metadataType = JsonUtils.extractStringArgument(params, "metadataType"); //$NON-NLS-1$
         String outputMode = JsonUtils.extractStringArgument(params, "outputMode"); //$NON-NLS-1$
 
         // Validate required parameters
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArguments(params, "projectName", "query"); //$NON-NLS-1$ //$NON-NLS-2$
+        if (err != null)
         {
-            return "Error: projectName is required"; //$NON-NLS-1$
-        }
-        if (query == null || query.isEmpty())
-        {
-            return "Error: query is required"; //$NON-NLS-1$
+            return err;
         }
 
         // Normalize output mode
@@ -151,19 +156,20 @@ public class SearchInCodeTool implements IMcpTool
         outputMode = outputMode.toLowerCase();
         if (!MODE_FULL.equals(outputMode) && !MODE_COUNT.equals(outputMode) && !MODE_FILES.equals(outputMode))
         {
-            return "Error: outputMode must be 'full', 'count', or 'files'"; //$NON-NLS-1$
+            return ToolResult.error("outputMode must be 'full', 'count', or 'files'").toJson(); //$NON-NLS-1$
         }
 
         // Clamp limits
-        maxResults = Math.min(Math.max(1, maxResults), ABSOLUTE_MAX_RESULTS);
+        maxResults = Pagination.clampLimit(maxResults, ABSOLUTE_MAX_RESULTS);
         contextLines = Math.min(Math.max(0, contextLines), MAX_CONTEXT_LINES);
 
         // Get project
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
 
         // Compile pattern
         Pattern pattern;
@@ -185,18 +191,18 @@ public class SearchInCodeTool implements IMcpTool
         }
         catch (PatternSyntaxException e)
         {
-            return "Error: Invalid regex pattern '" + query + "': " + e.getMessage(); //$NON-NLS-1$ //$NON-NLS-2$
+            return ToolResult.error("Invalid regex pattern '" + query + "': " + e.getMessage()).toJson(); //$NON-NLS-1$ //$NON-NLS-2$
         }
 
         // Resolve metadataType to folder prefix
         String metadataFolderPrefix = resolveMetadataFolder(metadataType);
         if (metadataType != null && !metadataType.isEmpty() && metadataFolderPrefix == null)
         {
-            return "Error: Unknown metadataType '" + metadataType + "'. " + //$NON-NLS-1$ //$NON-NLS-2$
+            return ToolResult.error("Unknown metadataType '" + metadataType + "'. " + //$NON-NLS-1$ //$NON-NLS-2$
                 "Supported: documents, catalogs, commonModules, informationRegisters, " + //$NON-NLS-1$
                 "accumulationRegisters, reports, dataProcessors, exchangePlans, " + //$NON-NLS-1$
                 "businessProcesses, tasks, constants, commonCommands, commonForms, " + //$NON-NLS-1$
-                "webServices, httpServices"; //$NON-NLS-1$
+                "webServices, httpServices").toJson(); //$NON-NLS-1$
         }
 
         // Search
@@ -213,12 +219,12 @@ public class SearchInCodeTool implements IMcpTool
             }
             else
             {
-                return "Error: src/ folder not found in project " + projectName; //$NON-NLS-1$
+                return ToolResult.error("src/ folder not found in project " + projectName).toJson(); //$NON-NLS-1$
             }
         }
         catch (CoreException e)
         {
-            return "Error searching project: " + e.getMessage(); //$NON-NLS-1$
+            return ToolResult.error("Failed to search project: " + e.getMessage()).toJson(); //$NON-NLS-1$
         }
 
         // Format output
@@ -281,14 +287,11 @@ public class SearchInCodeTool implements IMcpTool
             return sb.toString();
         }
 
-        sb.append("| File | Matches |\n"); //$NON-NLS-1$
-        sb.append("|------|---------|\n"); //$NON-NLS-1$
+        sb.append(MarkdownUtils.tableHeader("File", "Matches")); //$NON-NLS-1$ //$NON-NLS-2$
 
         for (Map.Entry<String, Integer> entry : collector.matchCountByFile.entrySet())
         {
-            sb.append("| ").append(entry.getKey()); //$NON-NLS-1$
-            sb.append(" | ").append(entry.getValue()); //$NON-NLS-1$
-            sb.append(" |\n"); //$NON-NLS-1$
+            sb.append(MarkdownUtils.tableRow(entry.getKey(), String.valueOf(entry.getValue())));
         }
 
         return sb.toString();
@@ -308,10 +311,7 @@ public class SearchInCodeTool implements IMcpTool
 
         sb.append("**Total:** ").append(totalMatches); //$NON-NLS-1$
         sb.append(" matches in ").append(totalFiles).append(" files"); //$NON-NLS-1$ //$NON-NLS-2$
-        if (shownMatches < totalMatches)
-        {
-            sb.append(" (showing first ").append(shownMatches).append(")"); //$NON-NLS-1$ //$NON-NLS-2$
-        }
+        sb.append(Pagination.truncationNotice(shownMatches, totalMatches));
         sb.append("\n"); //$NON-NLS-1$
 
         if (collector.skippedFiles > 0)

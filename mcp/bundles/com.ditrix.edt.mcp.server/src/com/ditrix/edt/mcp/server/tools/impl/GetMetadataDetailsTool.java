@@ -6,24 +6,38 @@
 
 package com.ditrix.edt.mcp.server.tools.impl;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.emf.ecore.EObject;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
 
+import com._1c.g5.v8.bm.core.IBmObject;
+import com._1c.g5.v8.bm.integration.IBmModel;
+import com._1c.g5.v8.dt.core.platform.IBmModelManager;
 import com._1c.g5.v8.dt.core.platform.IConfigurationProvider;
 import com._1c.g5.v8.dt.metadata.mdclass.Configuration;
 import com._1c.g5.v8.dt.metadata.mdclass.MdObject;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.tools.metadata.MetadataFormatterRegistry;
+import com.ditrix.edt.mcp.server.utils.BmTransactions;
+import com.ditrix.edt.mcp.server.utils.ExtensionOriginUtils;
+import com.ditrix.edt.mcp.server.utils.FormElementWriter;
+import com.ditrix.edt.mcp.server.utils.FormStructureReader;
+import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
+import com.ditrix.edt.mcp.server.utils.MetadataLanguageUtils;
+import com.ditrix.edt.mcp.server.utils.MetadataNodeResolver;
+import com.ditrix.edt.mcp.server.utils.MetadataPropertyIntrospector;
 import com.ditrix.edt.mcp.server.utils.MetadataTypeUtils;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool to get detailed properties of metadata objects from 1C configuration.
@@ -42,10 +56,16 @@ public class GetMetadataDetailsTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Get detailed properties of metadata objects from 1C configuration. " + //$NON-NLS-1$
-               "Returns basic info by default, or full details with 'full: true'."; //$NON-NLS-1$
+        return "Get detailed properties of one or more 1C metadata objects (basic info by default, " + //$NON-NLS-1$
+               "or every reflected section with 'full: true'). Use it after get_metadata_objects to " + //$NON-NLS-1$
+               "inspect a known object's attributes/forms/commands; in full mode each section is " + //$NON-NLS-1$
+               "capped so request fewer FQNs to keep the response small. A FORM FQN " + //$NON-NLS-1$
+               "('Catalog.X.Form.ItemForm' or 'CommonForm.Name') renders that form's STRUCTURE " + //$NON-NLS-1$
+               "(items / attributes / commands). " + //$NON-NLS-1$
+               "Use this for the full properties of one named object; to list objects by type use get_metadata_objects. " + //$NON-NLS-1$
+               "Full parameters and examples: call get_tool_guide('get_metadata_details')."; //$NON-NLS-1$
     }
-    
+
     @Override
     public String getInputSchema()
     {
@@ -53,16 +73,21 @@ public class GetMetadataDetailsTool implements IMcpTool
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringArrayProperty("objectFqns", //$NON-NLS-1$
-                "Array of FQNs (e.g. ['Catalog.Products', 'Document.SalesOrder']). " + //$NON-NLS-1$
-                "Russian type names are also supported (e.g. '\u0421\u043F\u0440\u0430\u0432\u043E\u0447\u043D\u0438\u043A.\u041D\u043E\u043C\u0435\u043D\u043A\u043B\u0430\u0442\u0443\u0440\u0430'). Required.", //$NON-NLS-1$
+                "Required. FQNs as Type.Name, e.g. ['Catalog.Products', 'Document.SalesOrder']; " + //$NON-NLS-1$
+                "Russian type tokens also work (e.g. '\u0421\u043F\u0440\u0430\u0432\u043E\u0447\u043D\u0438\u043A.Products').", //$NON-NLS-1$
                 true)
             .booleanProperty("full", //$NON-NLS-1$
-                "Return all properties (true) or only key info (false). Default: false") //$NON-NLS-1$
+                "All reflected properties (true) or only key info (false). Default: false") //$NON-NLS-1$
+            .booleanProperty("assignable", //$NON-NLS-1$
+                "Instead of the details view, return the ASSIGNABLE-property schema (default false): " + //$NON-NLS-1$
+                "per property its value kind, current value and ALLOWED values (enum literals). This " + //$NON-NLS-1$
+                "is what modify_metadata can set; FQNs may address members (e.g. " + //$NON-NLS-1$
+                "'Catalog.Products.Attribute.Weight').") //$NON-NLS-1$
             .stringProperty("language", //$NON-NLS-1$
-                "Language code for synonyms (e.g. 'en', 'ru'). Uses configuration default if not specified.") //$NON-NLS-1$
+                "Synonym language code, e.g. 'en'/'ru' (default: configuration default)") //$NON-NLS-1$
             .build();
     }
-    
+
     @Override
     public ResponseType getResponseType()
     {
@@ -86,38 +111,41 @@ public class GetMetadataDetailsTool implements IMcpTool
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         List<String> objectFqns = JsonUtils.extractArrayArgument(params, "objectFqns"); //$NON-NLS-1$
         String fullStr = JsonUtils.extractStringArgument(params, "full"); //$NON-NLS-1$
+        boolean assignable = JsonUtils.extractBooleanArgument(params, "assignable", false); //$NON-NLS-1$
         String language = JsonUtils.extractStringArgument(params, "language"); //$NON-NLS-1$
-        
+
         // Validate required parameters
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return "Error: projectName is required"; //$NON-NLS-1$
+            return err;
         }
-        
+
         if (objectFqns == null || objectFqns.isEmpty())
         {
-            return "Error: objectFqns is required (array of FQNs like 'Catalog.Products')"; //$NON-NLS-1$
+            return ToolResult.error("objectFqns is required (array of FQNs like 'Catalog.Products')").toJson(); //$NON-NLS-1$
         }
-        
+
         boolean full = "true".equalsIgnoreCase(fullStr); //$NON-NLS-1$
-        
+
         // Execute on UI thread
         AtomicReference<String> resultRef = new AtomicReference<>();
         final List<String> fqns = objectFqns;
         final boolean fullMode = full;
+        final boolean assignableMode = assignable;
         final String lang = language;
-        
+
         Display display = PlatformUI.getWorkbench().getDisplay();
         display.syncExec(() -> {
             try
             {
-                String result = getMetadataDetailsInternal(projectName, fqns, fullMode, lang);
+                String result = getMetadataDetailsInternal(projectName, fqns, fullMode, assignableMode, lang);
                 resultRef.set(result);
             }
             catch (Exception e)
             {
                 Activator.logError("Error getting metadata details", e); //$NON-NLS-1$
-                resultRef.set("Error: " + e.getMessage()); //$NON-NLS-1$
+                resultRef.set(ToolResult.error(e.getMessage()).toJson());
             }
         });
         
@@ -128,69 +156,193 @@ public class GetMetadataDetailsTool implements IMcpTool
      * Internal implementation that runs on UI thread.
      */
     private String getMetadataDetailsInternal(String projectName, List<String> objectFqns,
-                                               boolean full, String language)
+                                               boolean full, boolean assignable, String language)
     {
         // Get project
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
         
         // Get configuration
         IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
         if (configProvider == null)
         {
-            return "Error: Configuration provider not available"; //$NON-NLS-1$
+            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
         }
-        
+
         Configuration config = configProvider.getConfiguration(project);
         if (config == null)
         {
-            return "Error: Could not get configuration for project: " + projectName; //$NON-NLS-1$
+            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
         }
         
-        // Determine language for synonyms
-        String effectiveLanguage = language;
-        if (effectiveLanguage == null || effectiveLanguage.isEmpty())
-        {
-            if (config.getDefaultLanguage() != null)
-            {
-                effectiveLanguage = config.getDefaultLanguage().getName();
-            }
-            else
-            {
-                effectiveLanguage = "ru"; //$NON-NLS-1$
-            }
-        }
-        
+        // Determine language CODE for synonyms (the synonym map is keyed by code,
+        // e.g. "ru"/"en", not by the Language object's name). May be null when the
+        // configuration has no languages; downstream synonym lookup tolerates that.
+        String effectiveLanguage = MetadataLanguageUtils.resolveLanguageCode(config, language);
+
+        // The BM model is needed only to render a FORM's structure (a cross-model hop into the
+        // editable Form content); resolved best-effort (a form FQN with no model reports a failure).
+        IBmModelManager bmModelManager = Activator.getDefault().getBmModelManager();
+        IBmModel bmModel = bmModelManager != null ? bmModelManager.getModel(project) : null;
+
+        // An object's ORIGIN (core vs extension-adopted vs extension-own) is resolved
+        // against the project type, computed once for the whole request.
+        boolean isExtensionProject = ExtensionOriginUtils.isExtensionProject(project);
+
         StringBuilder sb = new StringBuilder();
         sb.append("# Metadata Details: ").append(projectName).append("\n\n"); //$NON-NLS-1$ //$NON-NLS-2$
-        
+
+        // Per-object outcomes are split into two channels so a structural client
+        // can tell a failed object from data: successfully resolved objects render
+        // as data in the body, while failures are collected and emitted as a
+        // dedicated, clearly-delimited machine-readable table at the end. A
+        // per-object failure is NOT a whole-call failure, so it stays in this
+        // success body (the top-level ToolResult.error channel above is reserved
+        // for whole-call failures such as a missing project or configuration).
+        List<String[]> failures = new ArrayList<>();
+
         // Process each FQN
         for (String fqn : objectFqns)
         {
-            String details = formatObjectDetails(config, fqn, full, effectiveLanguage);
-            sb.append(details);
+            // Assignable-schema mode: resolve the node (top object OR member) via the shared
+            // resolver and render its assignable-property table - what modify_metadata can set.
+            if (assignable)
+            {
+                MetadataNodeResolver.MetadataNode node = MetadataNodeResolver.resolveExisting(config, fqn);
+                if (node == null || node.object == null)
+                {
+                    failures.add(new String[] { fqn, describeResolutionFailure(fqn) });
+                    continue;
+                }
+                sb.append(formatAssignable(MetadataTypeUtils.normalizeFqn(fqn), node.object));
+                sb.append("\n---\n\n"); //$NON-NLS-1$
+                continue;
+            }
+
+            // A FQN that addresses a FORM ITSELF (Type.Object.Form.FormName or CommonForm.FormName)
+            // renders the form's STRUCTURE (items / attributes / commands) via the cross-model hop
+            // (FormStructureReader). Form MEMBERS use their own create/modify/delete FQNs; this branch
+            // is for the whole form.
+            String formPath = FormElementWriter.parseFormPath(MetadataTypeUtils.normalizeFqn(fqn));
+            if (formPath != null)
+            {
+                String formStructure = renderFormStructure(config, bmModel, formPath, effectiveLanguage);
+                if (formStructure == null)
+                {
+                    failures.add(new String[] { fqn, "the form has no editable content model (it may " //$NON-NLS-1$
+                        + "be empty, an ordinary/legacy form, or not yet built)" }); //$NON-NLS-1$
+                    continue;
+                }
+                sb.append(formStructure);
+                sb.append("\n---\n\n"); //$NON-NLS-1$
+                continue;
+            }
+
+            MdObject mdObject = resolveObject(config, fqn);
+            if (mdObject == null)
+            {
+                failures.add(new String[] { fqn, describeResolutionFailure(fqn) });
+                continue;
+            }
+            sb.append(MetadataFormatterRegistry.format(mdObject, full, effectiveLanguage));
+            // ORIGIN footer: core / core (adopted) / extension. For a base
+            // configuration this is always "core"; for an extension it distinguishes
+            // an adopted base object from one the extension itself owns.
+            sb.append("\n**Origin:** ") //$NON-NLS-1$
+                .append(ExtensionOriginUtils.originLabel(mdObject.getObjectBelonging(), isExtensionProject))
+                .append("\n"); //$NON-NLS-1$
             sb.append("\n---\n\n"); //$NON-NLS-1$
         }
-        
+
+        if (!failures.isEmpty())
+        {
+            sb.append(formatFailures(failures));
+        }
+
         return sb.toString();
     }
-    
+
     /**
-     * Formats details for a single metadata object.
+     * Renders a node's ASSIGNABLE-property schema as a Markdown table: per property its value kind,
+     * current value, and (for an enum) the allowed values. This is the discovery view for
+     * modify_metadata - it lists exactly what can be set and the valid enum literals. The shared
+     * {@link MarkdownUtils} builder escapes every cell.
+     *
+     * @param fqn the (normalized) FQN, for the section heading
+     * @param obj the resolved node (top object or member)
+     * @return the Markdown section
      */
-    private String formatObjectDetails(Configuration config, String fqn,
-                                        boolean full, String language)
+    private static String formatAssignable(String fqn, MdObject obj)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.append("## Assignable properties: ").append(fqn).append("\n\n"); //$NON-NLS-1$ //$NON-NLS-2$
+        sb.append("Set these with `modify_metadata`. For an ENUM property the value must be one of " //$NON-NLS-1$
+            + "the listed Allowed values.\n\n"); //$NON-NLS-1$
+        sb.append(MarkdownUtils.tableHeader("Property", "Kind", "Current", "Allowed values")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+        for (MetadataPropertyIntrospector.PropertyInfo p : MetadataPropertyIntrospector.introspect(obj))
+        {
+            String allowed = p.allowedValues.isEmpty() ? null : String.join(", ", p.allowedValues); //$NON-NLS-1$
+            sb.append(MarkdownUtils.tableRow(p.name, p.valueKind.toString(), p.currentValue, allowed));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Resolves a single FQN to its metadata object, or {@code null} when the FQN
+     * is malformed or the object does not exist. A {@code null} result is a
+     * per-object failure (recorded in the machine-readable failures table), never
+     * a whole-call failure.
+     */
+    /**
+     * Renders a form's structure (items / attributes / commands) for a form FQN, reusing
+     * {@code FormStructureReader}'s resolver + renderer: resolve the {@code BasicForm}, then inside a
+     * BM READ transaction reach its editable {@code Form} content and render it to markdown (the
+     * EObjects must not escape the read task). Returns {@code null} when the form has no editable
+     * content model (empty / legacy / not built) or the BM model is unavailable.
+     */
+    private static String renderFormStructure(Configuration config, IBmModel bmModel, String formPath,
+        String language)
+    {
+        if (bmModel == null)
+        {
+            return null;
+        }
+        MdObject mdForm = FormStructureReader.resolveMdForm(config, formPath);
+        if (!(mdForm instanceof IBmObject))
+        {
+            return null;
+        }
+        final long mdFormBmId = ((IBmObject)mdForm).bmGetId();
+        final String normalized = MetadataTypeUtils.normalizeFqn(formPath);
+        return BmTransactions.read(bmModel, "GetMetadataDetailsForm", (tx, monitor) -> //$NON-NLS-1$
+        {
+            EObject txMdForm = tx.getObjectById(mdFormBmId);
+            if (txMdForm == null)
+            {
+                return null;
+            }
+            EObject formModel = FormElementWriter.getEditableForm(txMdForm);
+            if (formModel == null)
+            {
+                return null;
+            }
+            return FormStructureReader.render(normalized, formModel, language);
+        });
+    }
+
+    private MdObject resolveObject(Configuration config, String fqn)
     {
         // Parse FQN: Type.Name
         String[] parts = fqn.split("\\."); //$NON-NLS-1$
         if (parts.length < 2)
         {
-            return "**Error:** Invalid FQN: " + fqn + ". Expected format: Type.Name (e.g. Catalog.Products)\n"; //$NON-NLS-1$ //$NON-NLS-2$
+            return null;
         }
-        
+
         String mdType = parts[0];
         String mdName = parts[1];
 
@@ -201,15 +353,41 @@ public class GetMetadataDetailsTool implements IMcpTool
             mdType = normalized;
         }
 
-        // Find the object
-        MdObject mdObject = MetadataTypeUtils.findObject(config, mdType, mdName);
-        if (mdObject == null)
-        {
-            return "**Error:** Object not found: " + fqn + "\n"; //$NON-NLS-1$ //$NON-NLS-2$
-        }
-        
-        // Use the new formatter registry
-        return MetadataFormatterRegistry.format(mdObject, full, language);
+        return MetadataTypeUtils.findObject(config, mdType, mdName);
     }
-    
+
+    /**
+     * Builds the machine-readable reason for a FQN that {@link #resolveObject}
+     * could not resolve. The reason becomes data in the failures table, never
+     * prose mixed into the data body.
+     */
+    String describeResolutionFailure(String fqn)
+    {
+        String[] parts = fqn.split("\\."); //$NON-NLS-1$
+        if (parts.length < 2)
+        {
+            return "Invalid FQN. Expected format: Type.Name (e.g. Catalog.Products)"; //$NON-NLS-1$
+        }
+        return "Object not found - use get_metadata_objects to list valid FQNs"; //$NON-NLS-1$
+    }
+
+    /**
+     * Renders the per-object failures as a dedicated, clearly-delimited
+     * machine-readable section. Every cell goes through the shared table builder,
+     * so an FQN or reason containing '|' or a newline cannot break the table. The
+     * heading marker {@code ## Errors} lets a structural client locate failed
+     * objects without scraping prose out of the data body.
+     */
+    String formatFailures(List<String[]> failures)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.append("## Errors\n\n"); //$NON-NLS-1$
+        sb.append(MarkdownUtils.tableHeader("FQN", "Status", "Reason")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        for (String[] failure : failures)
+        {
+            sb.append(MarkdownUtils.tableRow(failure[0], "ERROR", failure[1])); //$NON-NLS-1$
+        }
+        return sb.toString();
+    }
+
 }

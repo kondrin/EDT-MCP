@@ -53,6 +53,24 @@ public class TerminateLaunchToolTest
             desc.toLowerCase().contains("edt"));
     }
 
+    @Test
+    public void testGuideCarriesMigratedDetail()
+    {
+        // The exhaustive detail moved out of getDescription()/getInputSchema() and
+        // into getGuide() (Wave 2). Prove it landed there, not vanished.
+        IMcpTool tool = new TerminateLaunchTool();
+        String guide = tool.getGuide();
+        assertNotNull(guide);
+        assertTrue("guide should not be empty", guide.length() > 0);
+        // Detail migrated from the old description/schema prose.
+        assertTrue("guide should explain Attach disconnect semantics",
+            guide.contains("disconnected") && guide.toLowerCase().contains("attach"));
+        assertTrue("guide should explain the force OS-level escalation",
+            guide.toLowerCase().contains("force"));
+        assertTrue("guide should document the mutually-exclusive selection modes",
+            guide.contains("mutually exclusive"));
+    }
+
     // === Schema ===
 
     @Test
@@ -67,6 +85,9 @@ public class TerminateLaunchToolTest
         assertTrue(schema.contains("\"all\""));
         assertTrue(schema.contains("\"confirm\""));
         assertTrue(schema.contains("\"force\""));
+        // Canonical 'timeout' (aligned with run_yaxunit_tests) plus the back-compat
+        // 'timeoutSeconds' alias — both declared (and both read by execute()).
+        assertTrue(schema.contains("\"timeout\""));
         assertTrue(schema.contains("\"timeoutSeconds\""));
         assertTrue(schema.contains("\"includeAttach\""));
     }
@@ -124,7 +145,7 @@ public class TerminateLaunchToolTest
         IMcpTool tool = new TerminateLaunchTool();
         String result = tool.execute(new HashMap<String, String>());
         assertNotNull(result);
-        assertTrue("must be an error", result.startsWith("**Error:**"));
+        assertTrue("must be a structured error", result.contains("\"success\":false"));
         assertTrue("must mention 'Provide exactly one of'",
             result.contains("Provide exactly one of"));
     }
@@ -136,7 +157,7 @@ public class TerminateLaunchToolTest
         Map<String, String> params = new HashMap<>();
         params.put("applicationId", "8e2a-fake-id");
         String result = tool.execute(params);
-        assertTrue(result.startsWith("**Error:**"));
+        assertTrue(result.contains("\"success\":false"));
         assertTrue("must explain applicationId requires projectName",
             result.contains("`applicationId` requires `projectName`"));
     }
@@ -148,7 +169,7 @@ public class TerminateLaunchToolTest
         Map<String, String> params = new HashMap<>();
         params.put("projectName", "MyProject");
         String result = tool.execute(params);
-        assertTrue(result.startsWith("**Error:**"));
+        assertTrue(result.contains("\"success\":false"));
         assertTrue("must explain projectName alone is not a selection",
             result.contains("`projectName` alone is not a selection"));
     }
@@ -160,10 +181,12 @@ public class TerminateLaunchToolTest
         Map<String, String> params = new HashMap<>();
         params.put("all", "true");
         String result = tool.execute(params);
-        assertTrue(result.startsWith("**Error:**"));
-        assertTrue("must require confirm=true",
+        assertTrue(result.contains("\"success\":false"));
+        // The literal `confirm=true` would be unicode-escaped by Gson (it escapes
+        // '='), so assert on delimiter-free substrings of the same message.
+        assertTrue("must require confirmation",
             result.contains("Confirmation required")
-                && result.contains("confirm=true"));
+                && result.contains("confirm"));
     }
 
     @Test
@@ -175,9 +198,11 @@ public class TerminateLaunchToolTest
         params.put("all", "true");
         params.put("confirm", "true");
         String result = tool.execute(params);
-        assertTrue(result.startsWith("**Error:**"));
+        assertTrue(result.contains("\"success\":false"));
+        // `all=true` contains '=', which Gson unicode-escapes; assert on the
+        // delimiter-free leading portion of the same message instead.
         assertTrue("must explain applicationId vs all incompatibility",
-            result.contains("`applicationId` cannot be combined with `all=true`"));
+            result.contains("`applicationId` cannot be combined with `all"));
     }
 
     @Test
@@ -189,7 +214,7 @@ public class TerminateLaunchToolTest
         params.put("all", "true");
         params.put("confirm", "true");
         String result = tool.execute(params);
-        assertTrue(result.startsWith("**Error:**"));
+        assertTrue(result.contains("\"success\":false"));
         assertTrue("must report mutual exclusivity",
             result.contains("mutually exclusive"));
     }
@@ -203,7 +228,7 @@ public class TerminateLaunchToolTest
         params.put("projectName", "Proj");
         params.put("applicationId", "app-id");
         String result = tool.execute(params);
-        assertTrue(result.startsWith("**Error:**"));
+        assertTrue(result.contains("\"success\":false"));
         assertTrue("must report mutual exclusivity",
             result.contains("mutually exclusive"));
     }

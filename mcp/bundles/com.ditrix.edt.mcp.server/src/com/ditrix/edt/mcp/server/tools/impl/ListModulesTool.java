@@ -16,7 +16,6 @@ import org.eclipse.core.resources.IContainer;
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.Path;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
@@ -41,8 +40,13 @@ import com._1c.g5.v8.dt.metadata.mdclass.WebService;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
+import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
 import com.ditrix.edt.mcp.server.utils.MetadataTypeUtils;
+import com.ditrix.edt.mcp.server.utils.Pagination;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool to list all BSL modules in a project or for a specific metadata object.
@@ -63,9 +67,10 @@ public class ListModulesTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "List all BSL modules in an EDT project. " + //$NON-NLS-1$
-               "Can filter by metadata type (documents, catalogs, commonModules, etc.) " + //$NON-NLS-1$
-               "or by specific object name. Returns module path, type, and parent object."; //$NON-NLS-1$
+        return "List BSL modules in an EDT project as a table (module path, module type, parent type, parent name). " //$NON-NLS-1$
+            + "Use it to discover module paths before reading or editing code; filter by metadataType, objectName or nameFilter. " //$NON-NLS-1$
+            + "Use this to enumerate a project's modules; for the methods/regions inside one module use get_module_structure. " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('list_modules')."; //$NON-NLS-1$
     }
 
     @Override
@@ -74,17 +79,18 @@ public class ListModulesTool implements IMcpTool
         return JsonSchemaBuilder.object()
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name (required)", true) //$NON-NLS-1$
-            .stringProperty("metadataType", //$NON-NLS-1$
-                "Filter by type: 'all', 'documents', 'catalogs', 'commonModules', " + //$NON-NLS-1$
-                "'informationRegisters', 'accumulationRegisters', 'reports', 'dataProcessors', " + //$NON-NLS-1$
-                "'exchangePlans', 'businessProcesses', 'tasks', 'constants', " + //$NON-NLS-1$
-                "'commonCommands', 'commonForms', 'webServices', 'httpServices'. Default: 'all'") //$NON-NLS-1$
+            .enumProperty("metadataType", //$NON-NLS-1$
+                "Type filter, default 'all' (case-insensitive).", //$NON-NLS-1$
+                "all", "documents", "catalogs", "commonModules", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                "informationRegisters", "accumulationRegisters", "reports", "dataProcessors", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                "exchangePlans", "businessProcesses", "tasks", "constants", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                "commonCommands", "commonForms", "webServices", "httpServices") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
             .stringProperty("objectName", //$NON-NLS-1$
-                "Name of specific metadata object to list modules for (e.g. 'Products')") //$NON-NLS-1$
+                "Programmatic Name of one object to scope to, e.g. 'Products' (case-insensitive)") //$NON-NLS-1$
             .stringProperty("nameFilter", //$NON-NLS-1$
-                "Substring filter on module path (case-insensitive)") //$NON-NLS-1$
+                "Case-insensitive substring matched against the module path") //$NON-NLS-1$
             .integerProperty("limit", //$NON-NLS-1$
-                "Maximum number of results. Default: 200") //$NON-NLS-1$
+                "Max rows, default 200 (clamped to 1000)") //$NON-NLS-1$
             .build();
     }
 
@@ -108,23 +114,24 @@ public class ListModulesTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
+        {
+            return err;
+        }
+
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         String metadataType = JsonUtils.extractStringArgument(params, "metadataType"); //$NON-NLS-1$
         String objectName = JsonUtils.extractStringArgument(params, "objectName"); //$NON-NLS-1$
         String nameFilter = JsonUtils.extractStringArgument(params, "nameFilter"); //$NON-NLS-1$
         int limit = JsonUtils.extractIntArgument(params, "limit", 200); //$NON-NLS-1$
 
-        if (projectName == null || projectName.isEmpty())
-        {
-            return "Error: projectName is required"; //$NON-NLS-1$
-        }
-
         if (metadataType == null || metadataType.isEmpty())
         {
             metadataType = "all"; //$NON-NLS-1$
         }
 
-        limit = Math.min(Math.max(1, limit), 1000);
+        limit = Pagination.clampLimit(limit, 1000);
 
         AtomicReference<String> resultRef = new AtomicReference<>();
         final String mdType = metadataType;
@@ -142,7 +149,7 @@ public class ListModulesTool implements IMcpTool
             catch (Exception e)
             {
                 Activator.logError("Error listing modules", e); //$NON-NLS-1$
-                resultRef.set("Error: " + e.getMessage()); //$NON-NLS-1$
+                resultRef.set(ToolResult.error(e.getMessage()).toJson());
             }
         });
 
@@ -152,11 +159,12 @@ public class ListModulesTool implements IMcpTool
     private String listModulesInternal(String projectName, String metadataType,
                                         String objectName, String nameFilter, int limit)
     {
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
 
         List<ModuleInfo> modules = new ArrayList<>();
         String type = metadataType.toLowerCase();
@@ -172,13 +180,13 @@ public class ListModulesTool implements IMcpTool
         IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
         if (configProvider == null)
         {
-            return "Error: Configuration provider not available"; //$NON-NLS-1$
+            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
         }
 
         Configuration config = configProvider.getConfiguration(project);
         if (config == null)
         {
-            return "Error: Could not get configuration for project: " + projectName; //$NON-NLS-1$
+            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
         }
 
         switch (type)
@@ -254,11 +262,11 @@ public class ListModulesTool implements IMcpTool
                     "HTTPServices", "Module.bsl", "Module", "HTTPService"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
                 break;
             default:
-                return "Error: Unknown metadata type: " + metadataType + //$NON-NLS-1$
+                return ToolResult.error("Unknown metadata type: " + metadataType + //$NON-NLS-1$
                        ". Supported: all, documents, catalogs, commonModules, informationRegisters, " + //$NON-NLS-1$
                        "accumulationRegisters, reports, dataProcessors, exchangePlans, " + //$NON-NLS-1$
                        "businessProcesses, tasks, constants, commonCommands, commonForms, " + //$NON-NLS-1$
-                       "webServices, httpServices"; //$NON-NLS-1$
+                       "webServices, httpServices").toJson(); //$NON-NLS-1$
         }
 
         return formatOutput(projectName, modules, limit, metadataType);
@@ -549,7 +557,7 @@ public class ListModulesTool implements IMcpTool
             return;
         }
 
-        IFile file = project.getFile(new Path("src").append(modulePath)); //$NON-NLS-1$
+        IFile file = BslModuleUtils.resolveModuleFile(project, modulePath);
         if (file.exists())
         {
             ModuleInfo info = new ModuleInfo();
@@ -574,10 +582,7 @@ public class ListModulesTool implements IMcpTool
         int total = modules.size();
         int shown = Math.min(total, limit);
         sb.append("**Total:** ").append(total).append(" modules"); //$NON-NLS-1$ //$NON-NLS-2$
-        if (shown < total)
-        {
-            sb.append(" (showing ").append(shown).append(")"); //$NON-NLS-1$ //$NON-NLS-2$
-        }
+        sb.append(Pagination.truncationNotice(shown, total));
         sb.append("\n\n"); //$NON-NLS-1$
 
         if (modules.isEmpty())
@@ -586,8 +591,8 @@ public class ListModulesTool implements IMcpTool
             return sb.toString();
         }
 
-        sb.append("| Module Path | Module Type | Parent Type | Parent Name |\n"); //$NON-NLS-1$
-        sb.append("|-------------|-------------|-------------|-------------|\n"); //$NON-NLS-1$
+        sb.append(MarkdownUtils.tableHeader(
+            "Module Path", "Module Type", "Parent Type", "Parent Name")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
 
         int count = 0;
         for (ModuleInfo info : modules)
@@ -596,11 +601,8 @@ public class ListModulesTool implements IMcpTool
             {
                 break;
             }
-            sb.append("| ").append(info.modulePath); //$NON-NLS-1$
-            sb.append(" | ").append(info.moduleType); //$NON-NLS-1$
-            sb.append(" | ").append(info.parentType); //$NON-NLS-1$
-            sb.append(" | ").append(info.parentName); //$NON-NLS-1$
-            sb.append(" |\n"); //$NON-NLS-1$
+            sb.append(MarkdownUtils.tableRow(
+                info.modulePath, info.moduleType, info.parentType, info.parentName));
             count++;
         }
 

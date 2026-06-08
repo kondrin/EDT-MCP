@@ -93,18 +93,130 @@ public final class JsonUtils
         return GsonProvider.toJson(response);
     }
     
+    /** Readiness {@code status}: server running and all core services present. */
+    public static final String HEALTH_STATUS_OK = "ok"; //$NON-NLS-1$
+
+    /** Readiness {@code status}: MCP server not yet running (startup race). */
+    public static final String HEALTH_STATUS_STARTING = "starting"; //$NON-NLS-1$
+
+    /** Readiness {@code status}: server running but a core service is missing. */
+    public static final String HEALTH_STATUS_DEGRADED = "degraded"; //$NON-NLS-1$
+
     /**
-     * Builds a health check JSON response.
-     * 
+     * Builds a legacy health check JSON response (no readiness probing).
+     * Retained for back-compatibility; prefer the readiness-aware overload
+     * {@link #buildHealthResponse(String, boolean, Map)}.
+     *
      * @param edtVersion EDT version
      * @return JSON response string
      */
     public static String buildHealthResponse(String edtVersion)
     {
         JsonObject response = new JsonObject();
-        response.addProperty("status", "ok"); //$NON-NLS-1$ //$NON-NLS-2$
+        response.addProperty("status", HEALTH_STATUS_OK); //$NON-NLS-1$
+        response.addProperty("live", true); //$NON-NLS-1$
         response.addProperty("edt_version", edtVersion); //$NON-NLS-1$
         return GsonProvider.toJson(response);
+    }
+
+    /**
+     * Builds a readiness-aware health check JSON response.
+     * <p>
+     * The response is ADDITIVE and back-compatible: the top-level {@code status}
+     * stays a string and {@code edt_version} is preserved, so monitors that check
+     * for HTTP 200 + a {@code status} field keep working. New fields:
+     * <ul>
+     * <li>{@code live} — a cheap always-true liveness ping (the process answered),
+     * present regardless of readiness so a simple liveness check still works;</li>
+     * <li>{@code ready} — boolean readiness flag;</li>
+     * <li>{@code missingServices} — the names of the unavailable core services
+     * (empty when ready).</li>
+     * </ul>
+     * The {@code status} is {@link #HEALTH_STATUS_OK} only when {@code running}
+     * is true AND every reference in {@code coreServices} is non-null; it is
+     * {@link #HEALTH_STATUS_STARTING} when the server is not yet running, and
+     * {@link #HEALTH_STATUS_DEGRADED} when the server runs but a core service
+     * reference is null.
+     * <p>
+     * IMPORTANT: readiness is decided purely from the supplied {@code running}
+     * flag and the non-null-ness of the {@code coreServices} references. This
+     * method never reads/queries the EDT model and opens no transaction — a
+     * health probe must stay cheap.
+     *
+     * @param edtVersion the EDT version string (may be null)
+     * @param running whether the MCP server reports itself running
+     * @param coreServices ordered map of core service name to its reference
+     *            (a null value means the service is not yet available); may be null
+     * @return JSON response string
+     */
+    public static String buildHealthResponse(String edtVersion, boolean running,
+        Map<String, Object> coreServices)
+    {
+        List<String> missing = computeMissingServices(coreServices);
+        boolean ready = running && missing.isEmpty();
+
+        String status;
+        if (ready)
+        {
+            status = HEALTH_STATUS_OK;
+        }
+        else if (!running)
+        {
+            status = HEALTH_STATUS_STARTING;
+        }
+        else
+        {
+            status = HEALTH_STATUS_DEGRADED;
+        }
+
+        JsonObject response = new JsonObject();
+        response.addProperty("status", status); //$NON-NLS-1$
+        // Always-true liveness ping: the process is up and answered this request.
+        response.addProperty("live", true); //$NON-NLS-1$
+        response.addProperty("ready", ready); //$NON-NLS-1$
+        response.addProperty("running", running); //$NON-NLS-1$
+        response.addProperty("edt_version", edtVersion); //$NON-NLS-1$
+
+        JsonArray missingArray = new JsonArray();
+        for (String name : missing)
+        {
+            missingArray.add(name);
+        }
+        response.add("missingServices", missingArray); //$NON-NLS-1$
+
+        return GsonProvider.toJson(response);
+    }
+
+    /**
+     * Pure, side-effect-free readiness helper: returns the names of the core
+     * services whose reference is {@code null} (i.e. not yet available), in the
+     * iteration order of {@code coreServices}. An empty result means every core
+     * service reference is present.
+     * <p>
+     * This is the testable core of the readiness decision (see
+     * {@link #buildHealthResponse(String, boolean, Map)}); it only inspects
+     * non-null-ness of the supplied references and never touches the EDT model.
+     *
+     * @param coreServices map of core service name to its reference (null value
+     *            means missing); may be null or empty
+     * @return the ordered list of missing service names (never null; empty when
+     *         all present)
+     */
+    public static List<String> computeMissingServices(Map<String, Object> coreServices)
+    {
+        List<String> missing = new ArrayList<>();
+        if (coreServices == null)
+        {
+            return missing;
+        }
+        for (Map.Entry<String, Object> entry : coreServices.entrySet())
+        {
+            if (entry.getValue() == null)
+            {
+                missing.add(entry.getKey());
+            }
+        }
+        return missing;
     }
     
     /**
@@ -187,8 +299,57 @@ public final class JsonUtils
     }
     
     /**
+     * Extracts an array-of-objects argument from the params map. A complex argument arrives here as
+     * its JSON text (the protocol layer re-serializes nested JSON values into the string map), so a
+     * {@code properties} array like {@code [{"name":"synonym","value":"X","language":"ru"}]} is
+     * returned as a list of {@link JsonObject}. Non-object array elements are skipped.
+     *
+     * @param params the params map
+     * @param argumentName the argument name to extract
+     * @return the list of objects (never null; empty when the argument is absent, blank, not a JSON
+     *     array, or unparseable)
+     */
+    public static List<JsonObject> extractObjectArray(Map<String, String> params, String argumentName)
+    {
+        List<JsonObject> result = new ArrayList<>();
+        if (params == null || argumentName == null)
+        {
+            return result;
+        }
+        String value = params.get(argumentName);
+        if (value == null)
+        {
+            return result;
+        }
+        value = value.trim();
+        if (!value.startsWith("[")) //$NON-NLS-1$
+        {
+            return result;
+        }
+        try
+        {
+            JsonElement element = JsonParser.parseString(value);
+            if (element.isJsonArray())
+            {
+                for (JsonElement item : element.getAsJsonArray())
+                {
+                    if (item.isJsonObject())
+                    {
+                        result.add(item.getAsJsonObject());
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            // Malformed JSON: return what was collected (typically empty); the caller validates.
+        }
+        return result;
+    }
+
+    /**
      * Extracts a boolean argument from params map.
-     * 
+     *
      * @param params the params map
      * @param argumentName the argument name to extract
      * @param defaultValue the default value if not found or invalid
@@ -295,5 +456,125 @@ public final class JsonUtils
         {
             return defaultValue;
         }
+    }
+
+    /**
+     * Shared required-argument guard. Returns a structured error payload
+     * ({@code {"success":false,"error":"<name> is required"}}) when the named
+     * argument is missing or blank, or {@code null} when it is present. Usage:
+     * <pre>
+     * String err = JsonUtils.requireArgument(params, "projectName");
+     * if (err != null) return err;
+     * </pre>
+     * The error is recognised by the protocol's {@code isJsonErrorPayload}
+     * diversion and delivered as a structured {@code isError} regardless of the
+     * tool's normal response type, so this works for MARKDOWN/TEXT/JSON tools alike.
+     *
+     * @param params the params map
+     * @param argumentName the required argument name
+     * @return the error JSON to return, or {@code null} when the argument is present
+     */
+    public static String requireArgument(Map<String, String> params, String argumentName)
+    {
+        String value = extractStringArgument(params, argumentName);
+        if (value == null || value.isEmpty())
+        {
+            return ToolResult.error(argumentName + " is required" + discoveryHint(argumentName)).toJson(); //$NON-NLS-1$
+        }
+        return null;
+    }
+
+    /**
+     * Returns an actionable {@code ". Use <tool> to ..."} discovery suffix for a small set of
+     * canonical, ENUMERABLE parameter names, so a bare {@code "<name> is required"} error points the
+     * caller at the tool that lists valid values; returns an empty string for any other name. Only
+     * parameters whose valid values are discoverable via one specific tool are mapped - free-form
+     * values (a query, an expression, a path) get no hint, since a wrong hint is worse than none.
+     * The variadic {@link #requireArguments} inherits this automatically (it delegates here), and the
+     * two-arg {@link #requireArgument(Map, String, String)} keeps its caller-supplied detail instead.
+     *
+     * @param argumentName the required-argument name (may be {@code null})
+     * @return the discovery suffix (with a leading {@code ". "}) or {@code ""} when there is no
+     *     unambiguous discovery source
+     */
+    private static String discoveryHint(String argumentName)
+    {
+        if (argumentName == null)
+        {
+            return ""; //$NON-NLS-1$
+        }
+        switch (argumentName)
+        {
+            case "projectName": //$NON-NLS-1$
+                return ". Use list_projects to see available project names."; //$NON-NLS-1$
+            case "modulePath": //$NON-NLS-1$
+                return ". Use list_modules to find a module path in the project."; //$NON-NLS-1$
+            case "methodName": //$NON-NLS-1$
+                return ". Use get_module_structure to list the module's procedures and functions."; //$NON-NLS-1$
+            case "objectFqn": //$NON-NLS-1$
+                return ". Use get_metadata_objects to find an object's FQN."; //$NON-NLS-1$
+            case "fqn": //$NON-NLS-1$
+                return ". Use get_metadata_objects to find an object's FQN (e.g. Catalog.Products); for a" //$NON-NLS-1$
+                    + " nested member append the member path (e.g. Catalog.Products.Attribute.Price)," //$NON-NLS-1$
+                    + " whose names are listed by get_metadata_details."; //$NON-NLS-1$
+            case "applicationId": //$NON-NLS-1$
+                return ". Use get_applications to list available application IDs."; //$NON-NLS-1$
+            default:
+                return ""; //$NON-NLS-1$
+        }
+    }
+
+    /**
+     * Variant of {@link #requireArgument(Map, String)} for tools that append a
+     * usage hint after the canonical "<name> is required" text. The {@code detail}
+     * is concatenated VERBATIM (it must include its own leading separator, e.g.
+     * ". Example: ..." or " (e.g. ...)"), so the produced message is identical to
+     * the previous inline guard.
+     *
+     * @param params the params map
+     * @param argumentName the required argument name
+     * @param detail the exact suffix to append after "<name> is required" (may be empty)
+     * @return the error JSON to return, or {@code null} when the argument is present
+     */
+    public static String requireArgument(Map<String, String> params, String argumentName, String detail)
+    {
+        String value = extractStringArgument(params, argumentName);
+        if (value == null || value.isEmpty())
+        {
+            return ToolResult.error(argumentName + " is required" + (detail == null ? "" : detail)).toJson(); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        return null;
+    }
+
+    /**
+     * Variadic form of {@link #requireArgument(Map, String)} for tools with
+     * several required arguments. Checks the names in order and returns the
+     * error for the FIRST missing/blank one (matching the behaviour of
+     * sequential {@code requireArgument} guards), or {@code null} when all are
+     * present. Usage:
+     * <pre>
+     * String err = JsonUtils.requireArguments(params, "projectName", "modulePath", "methodName");
+     * if (err != null) return err;
+     * </pre>
+     *
+     * @param params the params map
+     * @param argumentNames the required argument names, in check order
+     * @return the error JSON for the first missing argument, or {@code null} when all are present
+     */
+    public static String requireArguments(Map<String, String> params, String... argumentNames)
+    {
+        if (argumentNames == null)
+        {
+            return null;
+        }
+        for (String argumentName : argumentNames)
+        {
+            String err = requireArgument(params, argumentName);
+            if (err != null)
+            {
+                return err;
+            }
+        }
+        return null;
     }
 }

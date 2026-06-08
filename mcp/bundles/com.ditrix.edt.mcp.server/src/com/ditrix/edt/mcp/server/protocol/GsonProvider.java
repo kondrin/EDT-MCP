@@ -15,9 +15,23 @@ import com.google.gson.GsonBuilder;
  */
 public final class GsonProvider
 {
-    /** Shared Gson instance - thread-safe for serialization/deserialization */
-    private static final Gson GSON = new GsonBuilder().create();
-    
+    /**
+     * Shared Gson instance - thread-safe for serialization/deserialization.
+     * HTML escaping is disabled: this output is JSON over MCP, not HTML, so raw
+     * apostrophes ({@code Field 'X' not found}) and operators ({@code >=}, {@code &},
+     * {@code <}) must stay readable for content/text consumers instead of being
+     * emitted as {@code \\uXXXX} escapes.
+     */
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+
+    /**
+     * Like {@link #GSON} but writes explicit nulls. Used only where the wire
+     * format requires a null-valued field to be present (e.g. JSON-RPC id:null on
+     * a parse-error response); the default {@link #GSON} omits null fields.
+     */
+    private static final Gson GSON_SERIALIZE_NULLS =
+        new GsonBuilder().serializeNulls().disableHtmlEscaping().create();
+
     private GsonProvider()
     {
         // Utility class
@@ -42,6 +56,19 @@ public final class GsonProvider
     public static String toJson(Object src)
     {
         return GSON.toJson(src);
+    }
+
+    /**
+     * Serializes to JSON writing explicit nulls. Use only where the wire format
+     * requires a null-valued field to be present (JSON-RPC id:null); the default
+     * {@link #toJson(Object)} omits nulls.
+     *
+     * @param src the object to serialize
+     * @return JSON string with null fields written
+     */
+    public static String toJsonSerializeNulls(Object src)
+    {
+        return GSON_SERIALIZE_NULLS.toJson(src);
     }
     
     /**

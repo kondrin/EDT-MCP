@@ -11,12 +11,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.emf.common.util.URI;
 import org.eclipse.emf.ecore.resource.Resource;
 import org.eclipse.emf.ecore.resource.ResourceSet;
@@ -36,9 +36,7 @@ import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
-
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool to validate 1C:Enterprise query language (QL) text in the context of a project.
@@ -61,23 +59,38 @@ public class ValidateQueryTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Validate 1C:Enterprise query language (QL) text in the context of a project. " + //$NON-NLS-1$
-               "Parses query text and returns syntax and semantic errors with line numbers. " + //$NON-NLS-1$
-               "Supports both regular queries and DCS (Data Composition System) queries."; //$NON-NLS-1$
+        return "Validate 1C:Enterprise query language (QL) text against a project, returning " + //$NON-NLS-1$
+               "syntax and semantic errors with line numbers. Use to check a query before " + //$NON-NLS-1$
+               "embedding it in BSL; resolves table/field names against the project's metadata. " + //$NON-NLS-1$
+               "Full parameters and examples: call get_tool_guide('validate_query')."; //$NON-NLS-1$
     }
-    
+
     @Override
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
             .stringProperty("projectName", //$NON-NLS-1$
-                "EDT project name (required)", true) //$NON-NLS-1$
+                "EDT project name (required).", true) //$NON-NLS-1$
             .stringProperty("queryText", //$NON-NLS-1$
-                "Query text to validate (required). The full text of the 1C query, e.g. " + //$NON-NLS-1$
-                "'SELECT Ref FROM Catalog.Products WHERE Description LIKE &SearchString'", true) //$NON-NLS-1$
+                "Full 1C query text to validate (required), e.g. 'SELECT Ref FROM Catalog.Products'.", //$NON-NLS-1$
+                true)
             .booleanProperty("dcsMode", //$NON-NLS-1$
-                "DCS (Data Composition System) mode. Set to true for queries used in " + //$NON-NLS-1$
-                "data composition schemas. Allows additional DCS-specific syntax. Default: false") //$NON-NLS-1$
+                "true for Data Composition System queries (allows DCS-specific syntax). Default: false.") //$NON-NLS-1$
+            .build();
+    }
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("valid", "true when the query has zero issues") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("dcsMode", "Whether DCS validation mode was used") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("errorCount", "Number of ERROR-severity issues") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("warningCount", "Number of WARNING-severity issues") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("infoCount", "Number of INFO-severity issues") //$NON-NLS-1$ //$NON-NLS-2$
+            .objectArrayProperty("issues", //$NON-NLS-1$
+                "Validation issues; each has severity, message, optional line/column/offset") //$NON-NLS-1$
             .build();
     }
     
@@ -94,28 +107,24 @@ public class ValidateQueryTool implements IMcpTool
         String queryText = JsonUtils.extractStringArgument(params, "queryText"); //$NON-NLS-1$
         boolean dcsMode = JsonUtils.extractBooleanArgument(params, "dcsMode", false); //$NON-NLS-1$
         
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArguments(params, "projectName", "queryText"); //$NON-NLS-1$ //$NON-NLS-2$
+        if (err != null)
         {
-            return ToolResult.error("projectName is required").toJson(); //$NON-NLS-1$
-        }
-        
-        if (queryText == null || queryText.isEmpty())
-        {
-            return ToolResult.error("queryText is required").toJson(); //$NON-NLS-1$
+            return err;
         }
         
         // Find the project
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
-        if (!project.isOpen())
+        if (!ctx.isOpen())
         {
             return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
         }
-        
-        return validateQuery(project, queryText, dcsMode);
+
+        return validateQuery(ctx.project(), queryText, dcsMode);
     }
     
     /**
@@ -267,7 +276,7 @@ public class ValidateQueryTool implements IMcpTool
             }
             
             // Build the result
-            return buildResult(queryText, issues, dcsMode);
+            return buildResult(issues, dcsMode);
         }
         catch (IOException e)
         {
@@ -302,62 +311,55 @@ public class ValidateQueryTool implements IMcpTool
     }
     
     /**
-     * Builds JSON result from validation issues.
-     * 
-     * @param queryText the original query text
+     * Builds the JSON result from validation issues, via the shared
+     * {@link ToolResult} builder (consistent with the tool's error paths and
+     * the rest of the server).
+     *
      * @param issues list of validation issues
      * @param dcsMode whether DCS mode was used
      * @return JSON result string
      */
-    private String buildResult(String queryText, List<QueryIssue> issues, boolean dcsMode)
+    static String buildResult(List<QueryIssue> issues, boolean dcsMode)
     {
-        JsonObject result = new JsonObject();
-        result.addProperty("success", true); //$NON-NLS-1$
-        result.addProperty("valid", issues.isEmpty()); //$NON-NLS-1$
-        result.addProperty("dcsMode", dcsMode); //$NON-NLS-1$
-        result.addProperty("errorCount", //$NON-NLS-1$
-            issues.stream().filter(i -> "ERROR".equals(i.severity)).count()); //$NON-NLS-1$
-        result.addProperty("warningCount", //$NON-NLS-1$
-            issues.stream().filter(i -> "WARNING".equals(i.severity)).count()); //$NON-NLS-1$
-        result.addProperty("infoCount", //$NON-NLS-1$
-            issues.stream().filter(i -> "INFO".equals(i.severity)).count()); //$NON-NLS-1$
-        
-        if (!issues.isEmpty())
+        List<Map<String, Object>> issueList = new ArrayList<>();
+        for (QueryIssue issue : issues)
         {
-            JsonArray issuesArray = new JsonArray();
-            for (QueryIssue issue : issues)
+            // LinkedHashMap to keep a stable, readable field order per issue.
+            Map<String, Object> issueObj = new LinkedHashMap<>();
+            issueObj.put("severity", issue.severity); //$NON-NLS-1$
+            issueObj.put("message", issue.message); //$NON-NLS-1$
+            if (issue.line > 0)
             {
-                JsonObject issueObj = new JsonObject();
-                issueObj.addProperty("severity", issue.severity); //$NON-NLS-1$
-                issueObj.addProperty("message", issue.message); //$NON-NLS-1$
-                if (issue.line > 0)
-                {
-                    issueObj.addProperty("line", issue.line); //$NON-NLS-1$
-                }
-                if (issue.column > 0)
-                {
-                    issueObj.addProperty("column", issue.column); //$NON-NLS-1$
-                }
-                if (issue.offset >= 0)
-                {
-                    issueObj.addProperty("offset", issue.offset); //$NON-NLS-1$
-                }
-                issuesArray.add(issueObj);
+                issueObj.put("line", issue.line); //$NON-NLS-1$
             }
-            result.add("issues", issuesArray); //$NON-NLS-1$
+            if (issue.column > 0)
+            {
+                issueObj.put("column", issue.column); //$NON-NLS-1$
+            }
+            if (issue.offset >= 0)
+            {
+                issueObj.put("offset", issue.offset); //$NON-NLS-1$
+            }
+            issueList.add(issueObj);
         }
-        else
-        {
-            result.add("issues", new JsonArray()); //$NON-NLS-1$
-        }
-        
-        return result.toString();
+
+        return ToolResult.success()
+            .put("valid", issues.isEmpty()) //$NON-NLS-1$
+            .put("dcsMode", dcsMode) //$NON-NLS-1$
+            .put("errorCount", //$NON-NLS-1$
+                issues.stream().filter(i -> "ERROR".equals(i.severity)).count()) //$NON-NLS-1$
+            .put("warningCount", //$NON-NLS-1$
+                issues.stream().filter(i -> "WARNING".equals(i.severity)).count()) //$NON-NLS-1$
+            .put("infoCount", //$NON-NLS-1$
+                issues.stream().filter(i -> "INFO".equals(i.severity)).count()) //$NON-NLS-1$
+            .put("issues", issueList) //$NON-NLS-1$
+            .toJson();
     }
     
     /**
      * Internal representation of a validation issue.
      */
-    private static class QueryIssue
+    static class QueryIssue
     {
         final String severity;
         final String message;

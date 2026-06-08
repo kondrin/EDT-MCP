@@ -10,14 +10,13 @@ import java.util.List;
 import java.util.Map;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
 
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 import com.e1c.g5.dt.applications.ApplicationException;
 import com.e1c.g5.dt.applications.ApplicationUpdateState;
@@ -55,7 +54,20 @@ public class GetApplicationsTool implements IMcpTool
             .stringProperty("projectName", "EDT project name (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
-    
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("project", "EDT project name the applications belong to") //$NON-NLS-1$ //$NON-NLS-2$
+            .objectArrayProperty("applications", "Applications with id, name, type and update state") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("count", "Number of applications found") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("message", "Informational message when no applications are found") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("defaultApplicationId", "Id of the project's default application") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
     @Override
     public ResponseType getResponseType()
     {
@@ -66,18 +78,20 @@ public class GetApplicationsTool implements IMcpTool
     public String execute(Map<String, String> params)
     {
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
-        
+
         // Validate project name
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return ToolResult.error("projectName is required").toJson(); //$NON-NLS-1$
+            return err;
         }
         
-        // Check if project is ready for operations
-        String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-        if (notReadyError != null)
+        // Refuse only the transient BUILDING state; a missing/closed project
+        // falls through to the value-naming 'Project not found' below.
+        String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+        if (building != null)
         {
-            return ToolResult.error(notReadyError).toJson();
+            return ToolResult.error(building).toJson();
         }
         
         return getApplications(projectName);
@@ -93,18 +107,19 @@ public class GetApplicationsTool implements IMcpTool
     {
         try
         {
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
-            IProject project = workspace.getRoot().getProject(projectName);
-            
-            if (project == null || !project.exists())
+            ProjectContext ctx = ProjectContext.of(projectName);
+
+            if (!ctx.exists())
             {
-                return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+                return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
             }
-            
-            if (!project.isOpen())
+
+            if (!ctx.isOpen())
             {
                 return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
             }
+
+            IProject project = ctx.project();
             
             // Get application manager
             IApplicationManager appManager = Activator.getDefault().getApplicationManager();

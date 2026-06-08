@@ -13,8 +13,6 @@ import java.util.List;
 import java.util.Map;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
 
 import com._1c.g5.v8.dt.core.platform.IDtProject;
 import com._1c.g5.v8.dt.core.platform.IDtProjectManager;
@@ -24,6 +22,7 @@ import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.FrontMatter;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 
 /**
@@ -49,26 +48,19 @@ public class GetTranslationProjectInfoTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Return LanguageTool metadata for a project: translation storages " //$NON-NLS-1$
-             + "declared on the project and available translation provider IDs. " //$NON-NLS-1$
-             + "Wraps IProjectInformationApi. " //$NON-NLS-1$
+        return "Return LanguageTool metadata for a project: the translation storages " //$NON-NLS-1$
+             + "declared on it and the available translation provider IDs. Use it to " //$NON-NLS-1$
+             + "check whether a dictionary storage is attached before translating; an " //$NON-NLS-1$
+             + "empty storages list means none is attached yet (set up manually in EDT). " //$NON-NLS-1$
              + "Requires EDT with LanguageTool installed. " //$NON-NLS-1$
-             + "If the storages list is empty, the configuration has no dictionary " //$NON-NLS-1$
-             + "storage attached yet. The user has to set this up in EDT manually " //$NON-NLS-1$
-             + "(no MCP tool for it): create a plain Eclipse project (File -> New -> " //$NON-NLS-1$
-             + "Project -> General -> Project), then attach it to the configuration " //$NON-NLS-1$
-             + "via the configuration project's properties (Translation settings). " //$NON-NLS-1$
-             + "Do NOT use any '1C:Enterprise -> Dependent translation project' " //$NON-NLS-1$
-             + "wizard — the dictionary storage project must be a plain Eclipse " //$NON-NLS-1$
-             + "project, and the configuration itself can also act as its own " //$NON-NLS-1$
-             + "storage if no separate Eclipse project is desired."; //$NON-NLS-1$
+             + "Full parameters and examples: call get_tool_guide('get_translation_project_info')."; //$NON-NLS-1$
     }
 
     @Override
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", "Project name (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("projectName", "EDT project name (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
 
@@ -81,30 +73,32 @@ public class GetTranslationProjectInfoTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return ToolResult.error("projectName is required").toJson(); //$NON-NLS-1$
+            return err;
         }
+
+        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
 
         try
         {
             // Resolve the IProject first so AI clients get a specific
-            // "Project not found or closed" diagnostic for unknown names
-            // instead of the generic "Not an EDT project" message that
-            // ProjectStateChecker.checkReadyOrError returns for missing
-            // projects.
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
-            IProject project = workspace.getRoot().getProject(projectName);
-            if (project == null || !project.exists() || !project.isOpen())
+            // "Project not found or closed" diagnostic (naming the value) for
+            // unknown names.
+            ProjectContext ctx = ProjectContext.of(projectName);
+            if (!ctx.isOpen())
             {
                 return ToolResult.error("Project not found or closed: " + projectName).toJson(); //$NON-NLS-1$
             }
+            IProject project = ctx.project();
 
-            String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-            if (notReadyError != null)
+            // The project is resolved and open above; refuse only the transient
+            // BUILDING state here (a missing/closed name was already named above).
+            String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+            if (building != null)
             {
-                return ToolResult.error(notReadyError).toJson();
+                return ToolResult.error(building).toJson();
             }
 
             IDtProjectManager dtProjectManager = Activator.getDefault().getDtProjectManager();
@@ -141,9 +135,11 @@ public class GetTranslationProjectInfoTool implements IMcpTool
             }
             else
             {
+                // IDs are wrapped in backticks so they round-trip VERBATIM into
+                // generate_translation_strings.storageId without the agent scraping prose.
                 for (String storage : storages)
                 {
-                    body.append("- ").append(storage).append('\n'); //$NON-NLS-1$
+                    body.append("- `").append(storage).append("`\n"); //$NON-NLS-1$ //$NON-NLS-2$
                 }
             }
             body.append("\n## Translation providers\n\n"); //$NON-NLS-1$
@@ -153,9 +149,11 @@ public class GetTranslationProjectInfoTool implements IMcpTool
             }
             else
             {
+                // Backticked for the same reason: a provider id feeds
+                // generate_translation_strings.providerId verbatim.
                 for (String provider : providers)
                 {
-                    body.append("- ").append(provider).append('\n'); //$NON-NLS-1$
+                    body.append("- `").append(provider).append("`\n"); //$NON-NLS-1$ //$NON-NLS-2$
                 }
             }
 

@@ -28,6 +28,9 @@ public class StepTool implements IMcpTool
     public static final String NAME = "step"; //$NON-NLS-1$
     private static final int DEFAULT_TIMEOUT = 30;
 
+    /** Hard cap on the wait window, prevents a worker thread blocking for hours. */
+    static final int MAX_TIMEOUT = 600;
+
     @Override
     public String getName()
     {
@@ -46,8 +49,24 @@ public class StepTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .integerProperty("threadId", "Thread id from wait_for_break (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("kind", "Step kind: over, into, out (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .enumProperty("kind", "Step kind: over, into, out (required)", true, //$NON-NLS-1$ //$NON-NLS-2$
+                "over", "into", "out") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             .integerProperty("timeout", "Wait window in seconds (default: 30)") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("hit", "True if a suspend event was caught, false on timeout") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("reason", "Reason when not hit (e.g. timeout)") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("threadId", "Id of the suspended thread") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("threadName", "Name of the suspended thread") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("applicationId", "Application id of the debug session") //$NON-NLS-1$ //$NON-NLS-2$
+            .objectArrayProperty("frames", "Stack frames: frameIndex, frameRef, name, line, modulePath, project") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("topFrameRef", "Stable ref of the top stack frame") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
 
@@ -62,8 +81,7 @@ public class StepTool implements IMcpTool
     {
         long threadId = JsonUtils.extractLongArgument(params, "threadId", -1L); //$NON-NLS-1$
         String kind = JsonUtils.extractStringArgument(params, "kind"); //$NON-NLS-1$
-        int timeout = JsonUtils.extractIntArgument(params, "timeout", DEFAULT_TIMEOUT); //$NON-NLS-1$
-        if (timeout < 1) timeout = 1;
+        int timeout = clampTimeout(JsonUtils.extractIntArgument(params, "timeout", DEFAULT_TIMEOUT)); //$NON-NLS-1$
 
         if (threadId <= 0)
         {
@@ -145,8 +163,25 @@ public class StepTool implements IMcpTool
         catch (Exception e)
         {
             Activator.logError("Error in step", e); //$NON-NLS-1$
-            return ToolResult.error("Error: " + e.getMessage()).toJson(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson(); //$NON-NLS-1$
         }
+    }
+
+    /**
+     * Clamps the requested wait window to {@code [1, MAX_TIMEOUT]} seconds so a
+     * worker thread can never block for hours on an unbounded value.
+     */
+    static int clampTimeout(int requested)
+    {
+        if (requested < 1)
+        {
+            return 1;
+        }
+        if (requested > MAX_TIMEOUT)
+        {
+            return MAX_TIMEOUT;
+        }
+        return requested;
     }
 
 }

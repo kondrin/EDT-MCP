@@ -67,6 +67,18 @@ public class EvaluateExpressionTool implements IMcpTool
     }
 
     @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("type", "BSL reference type name of the evaluated value") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("value", "String representation of the evaluated value (may be truncated)") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("truncated", "True when value was truncated to the max length") //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("fullLength", "Full length of value before truncation") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
+    @Override
     public ResponseType getResponseType()
     {
         return ResponseType.JSON;
@@ -82,9 +94,10 @@ public class EvaluateExpressionTool implements IMcpTool
         {
             return ToolResult.error("frameRef is required").toJson(); //$NON-NLS-1$
         }
-        if (expression == null || expression.isEmpty())
+        String err = JsonUtils.requireArgument(params, "expression"); //$NON-NLS-1$
+        if (err != null)
         {
-            return ToolResult.error("expression is required").toJson(); //$NON-NLS-1$
+            return err;
         }
 
         DebugSessionRegistry registry = DebugSessionRegistry.get();
@@ -172,7 +185,7 @@ public class EvaluateExpressionTool implements IMcpTool
         catch (Exception e)
         {
             Activator.logError("Error in evaluate_expression", e); //$NON-NLS-1$
-            return ToolResult.error("Error: " + e.getMessage()).toJson(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson(); //$NON-NLS-1$
         }
     }
 

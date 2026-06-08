@@ -18,6 +18,9 @@ import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.FrontMatter;
+
+import org.eclipse.core.resources.ResourcesPlugin;
 
 /**
  * Tool that wraps the EDT "Export → Configuration to XML Files" action.
@@ -47,7 +50,7 @@ public class ExportConfigurationToXmlTool implements IMcpTool
     {
         return "Export an EDT configuration project to XML files (EDT menu: " //$NON-NLS-1$
              + "Export -> Configuration to XML Files). Equivalent of 1C platform " //$NON-NLS-1$
-             + "DumpConfigToFiles. Wraps IExportConfigurationFilesApi.exportProject(String, Path)."; //$NON-NLS-1$
+             + "DumpConfigToFiles."; //$NON-NLS-1$
     }
 
     @Override
@@ -63,7 +66,7 @@ public class ExportConfigurationToXmlTool implements IMcpTool
     @Override
     public ResponseType getResponseType()
     {
-        return ResponseType.JSON;
+        return ResponseType.MARKDOWN;
     }
 
     @Override
@@ -72,13 +75,10 @@ public class ExportConfigurationToXmlTool implements IMcpTool
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         String outputPathStr = JsonUtils.extractStringArgument(params, "outputPath"); //$NON-NLS-1$
 
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArguments(params, "projectName", "outputPath"); //$NON-NLS-1$ //$NON-NLS-2$
+        if (err != null)
         {
-            return ToolResult.error("projectName is required").toJson(); //$NON-NLS-1$
-        }
-        if (outputPathStr == null || outputPathStr.isEmpty())
-        {
-            return ToolResult.error("outputPath is required").toJson(); //$NON-NLS-1$
+            return err;
         }
 
         try
@@ -96,6 +96,18 @@ public class ExportConfigurationToXmlTool implements IMcpTool
             }
             Files.createDirectories(outputPath);
 
+            // Defense-in-depth: export can write to ANY absolute path. With the
+            // server bound to loopback + optional token this is trusted-caller-only;
+            // still flag writes outside the workspace so an injected/erroneous call
+            // is visible. Non-breaking: warn, do not reject (local export to an
+            // external dir is a legitimate action).
+            boolean outsideWorkspace = isOutsideWorkspace(outputPath);
+            if (outsideWorkspace)
+            {
+                Activator.logWarning("export_configuration_to_xml: outputPath is OUTSIDE the EDT workspace: " //$NON-NLS-1$
+                    + outputPath + " (trusted-caller-only — see README Security & trust model)."); //$NON-NLS-1$
+            }
+
             Object api = Activator.getDefault().getExportConfigurationFilesApi();
             if (api == null)
             {
@@ -109,11 +121,32 @@ public class ExportConfigurationToXmlTool implements IMcpTool
                 String.class, Path.class);
             method.invoke(api, projectName, outputPath);
 
-            return ToolResult.success()
+            // Action result: status + the project and destination path. There is no
+            // round-trip ID, machine-structured position, declared outputSchema, or
+            // UI-bound payload here, so MARKDOWN is the right format (see the
+            // "Response format policy" in README / edt-mcp-tool-conventions).
+            FrontMatter fm = FrontMatter.create()
+                .put("tool", NAME) //$NON-NLS-1$
+                .put("status", "success") //$NON-NLS-1$ //$NON-NLS-2$
                 .put("project", projectName) //$NON-NLS-1$
-                .put("outputPath", outputPath.toString()) //$NON-NLS-1$
-                .put("message", "Configuration exported to XML files.") //$NON-NLS-1$ //$NON-NLS-2$
-                .toJson();
+                .put("outputPath", outputPath.toString()); //$NON-NLS-1$
+            if (outsideWorkspace)
+            {
+                fm.put("outsideWorkspace", true); //$NON-NLS-1$
+            }
+
+            StringBuilder body = new StringBuilder();
+            body.append("# Configuration exported to XML files\n\n"); //$NON-NLS-1$
+            body.append("- Project: ").append(projectName).append('\n'); //$NON-NLS-1$
+            body.append("- Output path: ").append(outputPath).append('\n'); //$NON-NLS-1$
+            if (outsideWorkspace)
+            {
+                body.append('\n')
+                    .append("> Note: outputPath is outside the EDT workspace; ") //$NON-NLS-1$
+                    .append("ensure the caller is trusted.\n"); //$NON-NLS-1$
+            }
+
+            return fm.wrapContent(body.toString());
         }
         catch (InvocationTargetException e)
         {
@@ -130,6 +163,31 @@ public class ExportConfigurationToXmlTool implements IMcpTool
         {
             Activator.logError("Unexpected error in export_configuration_to_xml", e); //$NON-NLS-1$
             return ToolResult.error(e.getMessage()).toJson();
+        }
+    }
+
+    /**
+     * Returns true if {@code path} is not under the Eclipse workspace root.
+     * Used to flag (not block) configuration exports to external locations.
+     * Deliberately fails OPEN (returns false on any uncertainty): this is an
+     * advisory-only check, so a false negative merely omits a warning and never
+     * rejects a legitimate export.
+     */
+    private static boolean isOutsideWorkspace(Path path)
+    {
+        try
+        {
+            org.eclipse.core.runtime.IPath loc = ResourcesPlugin.getWorkspace().getRoot().getLocation();
+            if (loc == null)
+            {
+                return false;
+            }
+            Path wsRoot = loc.toFile().toPath().toAbsolutePath().normalize();
+            return !path.startsWith(wsRoot);
+        }
+        catch (Exception e)
+        {
+            return false; // cannot determine — do not flag
         }
     }
 }

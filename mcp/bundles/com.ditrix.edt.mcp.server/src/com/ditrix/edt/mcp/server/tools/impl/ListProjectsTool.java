@@ -14,7 +14,9 @@ import org.eclipse.core.resources.ResourcesPlugin;
 
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.Log;
 import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker.ProjectStateResult;
@@ -43,7 +45,7 @@ public class ListProjectsTool implements IMcpTool
     {
         return JsonSchemaBuilder.object().build();
     }
-    
+
     @Override
     public String execute(Map<String, String> params)
     {
@@ -131,7 +133,11 @@ public class ListProjectsTool implements IMcpTool
                         }
                         catch (Exception e)
                         {
-                            // Ignore errors for specific project
+                            // Per-project failure is non-fatal (the row still lists
+                            // the project with "-" placeholders), but log it at WARNING
+                            // so a swallowed failure leaves a traceable server-side line.
+                            Log.warning("list_projects: failed to read nature/state for project '" //$NON-NLS-1$
+                                + project.getName() + "': " + e.getMessage()); //$NON-NLS-1$
                         }
                     }
                     
@@ -145,7 +151,7 @@ public class ListProjectsTool implements IMcpTool
         catch (Exception e)
         {
             Activator.logError("Failed to list projects", e); //$NON-NLS-1$
-            return "**Error:** " + e.getMessage(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson();
         }
         
         return md.toString();

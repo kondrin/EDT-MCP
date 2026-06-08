@@ -1,0 +1,125 @@
+name: MCP Conformance (reusable)
+
+# REUSABLE protocol-conformance gate (on: workflow_call) — invoked once per EDT
+# version by the thin caller workflows conformance-2025.2.yml / conformance-2026.1.yml,
+# so each version gets its OWN status badge. Runs the official
+# modelcontextprotocol/conformance suite against a LIVE MCP server and compares against
+# the committed baseline of intentional gaps, so the gate catches protocol REGRESSIONS
+# — not the known, deliberate gaps.
+#
+# Runs entirely on STOCK GitHub-hosted runners (ubuntu-latest): no docker image, no
+# self-hosted runner. The `build` job builds the MCP plugin; the `conformance` job then
+# uses the `setup-edt` composite to materialize Eclipse + 1C:EDT of inputs.edt (from the
+# public p2) + the built plugin, boots EDT headless under Xvfb, and the conformance
+# client hits the local :8765. Conformance is protocol-only — no EDT project and no 1C
+# platform license needed.
+#
+# Note: the plugin is COMPILED against the 2025.2 target platform, so a 2026.1 run is a
+# runtime compatibility check ("does the 2025.2-built plugin run on EDT 2026.1").
+
+on:
+  workflow_call:
+    inputs:
+      edt:
+        description: "EDT version (public p2 ruby/<version>/)"
+        required: true
+        type: string
+      spec_version:
+        description: "MCP spec version to test against"
+        required: false
+        default: "2025-11-25"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      - name: Cache Tycho P2 repositories
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository/.cache/tycho
+            ~/.m2/repository/p2
+          key: ${{ runner.os }}-tycho-p2-${{ hashFiles('**/pom.xml', '**/*.target') }}
+          restore-keys: |
+            ${{ runner.os }}-tycho-p2-
+
+      - name: Build the MCP plugin (p2 repository)
+        working-directory: mcp
+        env:
+          MAVEN_OPTS: -Xmx2g -XX:+UseParallelGC
+        run: mvn clean verify --batch-mode --no-transfer-progress -T 1C -DskipTests
+
+      - name: Upload plugin p2 repository
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcp-plugin-p2
+          path: mcp/repositories/com.ditrix.edt.mcp.server.repository/target/repository
+          if-no-files-found: error
+
+  conformance:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Download plugin p2 repository
+        uses: actions/download-artifact@v8
+        with:
+          name: mcp-plugin-p2
+          path: plugin-p2
+
+      - name: Set up headless EDT ${{ inputs.edt }} + MCP server
+        uses: ./.github/actions/setup-edt
+        with:
+          plugin-repo: plugin-p2
+          edt-p2: "https://edt.1c.ru/downloads/releases/ruby/${{ inputs.edt }}/"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          # @modelcontextprotocol/conformance@latest uses fs.globSync, which is Node 22+
+          # only (Node 20 errors: "module 'fs' does not provide an export named 'globSync'").
+          node-version: "22"
+
+      - name: Run MCP conformance suite
+        env:
+          SPEC_VERSION: ${{ inputs.spec_version }}
+        run: |
+          npx --yes @modelcontextprotocol/conformance@latest server \
+            --url "http://127.0.0.1:8765/mcp" \
+            --spec-version "$SPEC_VERSION" \
+            --expected-failures tests/conformance/baseline.yml
+
+      - name: Upload EDT log
+        if: ${{ always() && env.edt_log != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-edt-log-${{ inputs.edt }}
+          path: ${{ env.edt_log }}
+          if-no-files-found: ignore
+
+      - name: Stop EDT
+        if: always()
+        run: kill "${edt_pid:-0}" 2>/dev/null || true

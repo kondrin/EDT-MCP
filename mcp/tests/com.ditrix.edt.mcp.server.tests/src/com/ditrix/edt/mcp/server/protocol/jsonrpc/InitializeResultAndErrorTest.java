@@ -114,6 +114,30 @@ public class InitializeResultAndErrorTest
     }
 
     @Test
+    public void testJsonRpcErrorNullIdNotFabricated()
+    {
+        // The DTO path (used for id-bearing responses) omits a null id via the
+        // shared null-omitting Gson. The wire path for an undeterminable id is
+        // McpProtocolHandler.buildErrorResponse, which writes "id":null explicitly
+        // (covered in McpProtocolHandlerTest).
+        JsonRpcResponse response = JsonRpcResponse.error(null, -32600, "Invalid Request");
+        String json = GsonProvider.toJson(response);
+
+        JsonObject parsed = JsonParser.parseString(json).getAsJsonObject();
+        assertFalse("null id must not be serialized as a fabricated value", parsed.has("id"));
+        assertNotNull(parsed.get("error"));
+    }
+
+    @Test
+    public void testJsonRpcSuccessRealIdPreserved()
+    {
+        // A non-null id must pass through unchanged (normalization only touches null).
+        JsonRpcResponse response = JsonRpcResponse.success(42, "ok");
+        JsonObject parsed = JsonParser.parseString(GsonProvider.toJson(response)).getAsJsonObject();
+        assertEquals(42, parsed.get("id").getAsInt());
+    }
+
+    @Test
     public void testJsonRpcErrorCodes()
     {
         // Verify standard JSON-RPC error codes are negative

@@ -10,10 +10,9 @@ import java.util.Map;
 import java.util.Optional;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IWorkspace;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.debug.core.DebugPlugin;
+import org.eclipse.debug.core.ILaunch;
 import org.eclipse.debug.core.ILaunchConfiguration;
 import org.eclipse.debug.core.ILaunchConfigurationType;
 import org.eclipse.debug.core.ILaunchManager;
@@ -28,6 +27,7 @@ import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.DebugSessionRegistry;
 import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 import com.e1c.g5.dt.applications.ApplicationException;
 import com.e1c.g5.dt.applications.IApplication;
@@ -62,15 +62,12 @@ public class DebugLaunchTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Start an EDT debug session. " //$NON-NLS-1$
-            + "Pass launchConfigurationName to run any existing EDT debug configuration by name " //$NON-NLS-1$
-            + "(runtime client OR 'Attach to 1C:Enterprise Debug Server' — required for debugging " //$NON-NLS-1$
-            + "server-side code: HTTP services, background jobs, scheduled jobs). " //$NON-NLS-1$
-            + "Otherwise pass projectName + applicationId to launch the matching runtime-client config. " //$NON-NLS-1$
-            + "If a previous launch of the same configuration is still alive, the tool short-circuits " //$NON-NLS-1$
-            + "with `alreadyRunning: true` and does NOT spawn a fresh client — to force a clean restart " //$NON-NLS-1$
-            + "(e.g. after code changes that require a new session), call `terminate_launch` first, " //$NON-NLS-1$
-            + "then `debug_launch` again."; //$NON-NLS-1$
+        return "Start an EDT debug session: either an existing config by launchConfigurationName " //$NON-NLS-1$
+            + "(runtime client OR Attach, the latter needed to debug server-side code), or a " //$NON-NLS-1$
+            + "runtime-client config matched by projectName + applicationId. If that config is " //$NON-NLS-1$
+            + "already running it short-circuits with alreadyRunning:true (terminate_launch first " //$NON-NLS-1$
+            + "to force a restart). " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('debug_launch')."; //$NON-NLS-1$
     }
 
     @Override
@@ -78,14 +75,29 @@ public class DebugLaunchTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .stringProperty("projectName", //$NON-NLS-1$
-                "EDT project name (required unless launchConfigurationName is given)") //$NON-NLS-1$
+                "EDT project name; required unless launchConfigurationName is given.") //$NON-NLS-1$
             .stringProperty("applicationId", //$NON-NLS-1$
-                "Application ID from get_applications (required for runtime-client launches)") //$NON-NLS-1$
+                "Application ID from get_applications; required in the projectName+applicationId mode.") //$NON-NLS-1$
             .stringProperty("launchConfigurationName", //$NON-NLS-1$
-                "Exact name of an EDT debug launch configuration (runtime client or Attach). " //$NON-NLS-1$
-                    + "Use for Attach configurations or to pick a specific client config by name.") //$NON-NLS-1$
+                "Exact name of an EDT debug launch config (runtime client or Attach); skips projectName/applicationId.") //$NON-NLS-1$
             .booleanProperty("updateBeforeLaunch", //$NON-NLS-1$
-                "If true — update database before launching (default: true, ignored for Attach)") //$NON-NLS-1$
+                "Update the database before launching. Default true; ignored for Attach.") //$NON-NLS-1$
+            .build();
+    }
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("launchConfiguration", "Name of the launched/running launch configuration") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("configurationType", "Launch configuration type id") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("attach", "True if this is an Attach (server-side debug) configuration") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("project", "EDT project name associated with the launch") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("applicationId", "Application id of the launched configuration") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("alreadyRunning", "True if a matching session was already alive; re-launch skipped") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("mode", "Launch mode of the session (e.g. debug, run)") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("message", "Human-readable status message") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
 
@@ -121,10 +133,12 @@ public class DebugLaunchTool implements IMcpTool
                 + "or pass launchConfigurationName to start a config by name (e.g. an Attach config).").toJson(); //$NON-NLS-1$
         }
 
-        String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-        if (notReadyError != null)
+        // Refuse only the transient BUILDING state; a missing/closed project falls
+        // through to the value-naming "Project not found" below.
+        String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+        if (building != null)
         {
-            return ToolResult.error(notReadyError).toJson();
+            return ToolResult.error(building).toJson();
         }
 
         return launchDebug(projectName, applicationId, updateBeforeLaunch);
@@ -232,18 +246,19 @@ public class DebugLaunchTool implements IMcpTool
     {
         try
         {
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
-            IProject project = workspace.getRoot().getProject(projectName);
+            ProjectContext ctx = ProjectContext.of(projectName);
 
-            if (project == null || !project.exists())
+            if (!ctx.exists())
             {
-                return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+                return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
             }
 
-            if (!project.isOpen())
+            if (!ctx.isOpen())
             {
                 return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
             }
+
+            IProject project = ctx.project();
 
             // Verify application exists and get its name
             IApplicationManager appManager = Activator.getDefault().getApplicationManager();
@@ -294,6 +309,31 @@ public class DebugLaunchTool implements IMcpTool
                 if (activeConfigName != null)
                 {
                     already.put("launchConfiguration", activeConfigName); //$NON-NLS-1$
+                }
+                return already.toJson();
+            }
+
+            // A non-terminated launch may exist for this application WITHOUT a debug
+            // target - e.g. it was started in RUN mode. findActiveTarget() (debug
+            // targets only) misses it, so without this guard debug_launch would start
+            // a SECOND client over the running one. (audit A12)
+            ILaunch activeLaunch = DebugSessionRegistry.findActiveLaunch(applicationId);
+            if (activeLaunch != null)
+            {
+                String runningMode = activeLaunch.getLaunchMode();
+                ILaunchConfiguration activeConfig = activeLaunch.getLaunchConfiguration();
+                ToolResult already = ToolResult.success()
+                    .put("project", projectName) //$NON-NLS-1$
+                    .put("applicationId", applicationId) //$NON-NLS-1$
+                    .put("attach", false) //$NON-NLS-1$
+                    .put("alreadyRunning", true) //$NON-NLS-1$
+                    .put("mode", runningMode) //$NON-NLS-1$
+                    .put("message", "Application is already running (mode: " + runningMode //$NON-NLS-1$ //$NON-NLS-2$
+                        + ") - skipped launch to avoid a second client over the running session. " //$NON-NLS-1$
+                        + "Call terminate_launch first to force a fresh session."); //$NON-NLS-1$
+                if (activeConfig != null)
+                {
+                    already.put("launchConfiguration", activeConfig.getName()); //$NON-NLS-1$
                 }
                 return already.toJson();
             }
@@ -382,12 +422,12 @@ public class DebugLaunchTool implements IMcpTool
         {
             return null;
         }
-        IWorkspace workspace = ResourcesPlugin.getWorkspace();
-        IProject project = workspace.getRoot().getProject(projectName);
-        if (project == null || !project.exists() || !project.isOpen())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.isOpen())
         {
             return null;
         }
+        IProject project = ctx.project();
         IApplicationManager appManager = Activator.getDefault().getApplicationManager();
         if (appManager == null)
         {

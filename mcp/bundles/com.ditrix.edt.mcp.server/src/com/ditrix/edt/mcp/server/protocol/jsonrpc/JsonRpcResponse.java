@@ -19,7 +19,7 @@ public class JsonRpcResponse
     private JsonRpcResponse()
     {
     }
-    
+
     /**
      * Creates a success response with result.
      */
@@ -30,9 +30,15 @@ public class JsonRpcResponse
         response.result = result;
         return response;
     }
-    
+
     /**
      * Creates an error response.
+     * <p>
+     * This DTO is serialized by the null-omitting shared Gson, so a null {@code id}
+     * is omitted here. The wire path for an undeterminable id (parse / invalid
+     * request) does NOT use this factory:
+     * {@code McpProtocolHandler.buildErrorResponse} builds that envelope explicitly
+     * and writes {@code "id":null} per JSON-RPC 2.0.
      */
     public static JsonRpcResponse error(Object id, int code, String message)
     {

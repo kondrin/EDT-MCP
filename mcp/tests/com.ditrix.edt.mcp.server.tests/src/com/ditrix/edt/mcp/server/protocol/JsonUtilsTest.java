@@ -44,6 +44,151 @@ public class JsonUtilsTest
         assertNull(JsonUtils.extractStringArgument(params, "otherKey"));
     }
 
+    // --- requireArgument ---
+
+    @Test
+    public void testRequireArgumentPresentReturnsNull()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("projectName", "TestProject");
+        assertNull(JsonUtils.requireArgument(params, "projectName"));
+    }
+
+    @Test
+    public void testRequireArgumentMissingReturnsErrorJson()
+    {
+        String err = JsonUtils.requireArgument(new HashMap<>(), "projectName");
+        assertNotNull(err);
+        // Structured error payload; "projectName is required" is delimiter-free.
+        assertTrue(err.contains("\"success\":false"));
+        assertTrue(err.contains("projectName is required"));
+    }
+
+    @Test
+    public void testRequireArgumentEmptyReturnsErrorJson()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("objectFqn", "");
+        String err = JsonUtils.requireArgument(params, "objectFqn");
+        assertNotNull(err);
+        assertTrue(err.contains("objectFqn is required"));
+    }
+
+    // --- requireArgument discovery hint (actionable "<name> is required") ---
+
+    @Test
+    public void testRequireArgumentProjectNameCarriesDiscoveryHint()
+    {
+        // A bare "<name> is required" for a canonical, enumerable param now steers the caller to the
+        // discovery tool (projectName -> list_projects), making the error actionable.
+        String err = JsonUtils.requireArgument(new HashMap<>(), "projectName");
+        assertNotNull(err);
+        assertTrue(err.contains("projectName is required"));
+        assertTrue("projectName-required must steer to list_projects", err.contains("list_projects"));
+    }
+
+    @Test
+    public void testRequireArgumentMappedParamsCarryTheirOwnDiscoveryTool()
+    {
+        assertTrue(JsonUtils.requireArgument(new HashMap<>(), "modulePath").contains("list_modules"));
+        assertTrue(JsonUtils.requireArgument(new HashMap<>(), "methodName").contains("get_module_structure"));
+        assertTrue(JsonUtils.requireArgument(new HashMap<>(), "objectFqn").contains("get_metadata_objects"));
+        assertTrue(JsonUtils.requireArgument(new HashMap<>(), "applicationId").contains("get_applications"));
+        // The unified metadata CRUD tools (create/modify/delete_metadata) address by `fqn`; a missing
+        // fqn must steer to discovery + show the nested-member shape.
+        String fqnHint = JsonUtils.requireArgument(new HashMap<>(), "fqn");
+        assertTrue("fqn-required must steer to get_metadata_objects", fqnHint.contains("get_metadata_objects"));
+        assertTrue("fqn-required must show the nested-member shape", fqnHint.contains("Attribute"));
+    }
+
+    @Test
+    public void testRequireArgumentUnmappedParamHasNoDiscoveryHint()
+    {
+        // A free-form value (no enumerable source) keeps the canonical message with NO "Use <tool>"
+        // hint - inventing a wrong discovery tool would be worse than none.
+        String err = JsonUtils.requireArgument(new HashMap<>(), "queryText");
+        assertNotNull(err);
+        assertTrue(err.contains("queryText is required"));
+        assertFalse("an unmapped param must not invent a discovery tool", err.contains("Use "));
+    }
+
+    @Test
+    public void testRequireArgumentsVariadicInheritsDiscoveryHint()
+    {
+        // The variadic form delegates to the 1-arg guard, so the missing arg's hint comes through.
+        Map<String, String> params = new HashMap<>();
+        params.put("projectName", "P");
+        String err = JsonUtils.requireArguments(params, "projectName", "modulePath");
+        assertNotNull(err);
+        assertTrue(err.contains("modulePath is required"));
+        assertTrue(err.contains("list_modules"));
+    }
+
+    // --- requireArgument(Map, String, detail) ---
+
+    @Test
+    public void testRequireArgumentWithDetailPresentReturnsNull()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("modulePath", "CommonModules/M/Module.bsl");
+        assertNull(JsonUtils.requireArgument(params, "modulePath",
+            ". Example: CommonModules/MyModule/Module.bsl"));
+    }
+
+    @Test
+    public void testRequireArgumentWithDetailMissingAppendsDetail()
+    {
+        String err = JsonUtils.requireArgument(new HashMap<>(), "modulePath",
+            ". Example: CommonModules/MyModule/Module.bsl");
+        assertNotNull(err);
+        assertTrue(err.contains("\"success\":false"));
+        // Canonical text plus the verbatim detail suffix (both delimiter-free here).
+        assertTrue(err.contains("modulePath is required"));
+        assertTrue(err.contains("Example: CommonModules/MyModule/Module.bsl"));
+    }
+
+    // --- requireArguments (variadic) ---
+
+    @Test
+    public void testRequireArgumentsAllPresentReturnsNull()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("projectName", "TestProject");
+        params.put("modulePath", "CommonModules/M/Module.bsl");
+        params.put("methodName", "Foo");
+        assertNull(JsonUtils.requireArguments(params, "projectName", "modulePath", "methodName"));
+    }
+
+    @Test
+    public void testRequireArgumentsReturnsFirstMissingInOrder()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("methodName", "Foo");
+        // projectName and modulePath both missing; first in order (projectName) wins.
+        String err = JsonUtils.requireArguments(params, "projectName", "modulePath", "methodName");
+        assertNotNull(err);
+        assertTrue(err.contains("projectName is required"));
+        assertFalse(err.contains("modulePath"));
+    }
+
+    @Test
+    public void testRequireArgumentsBlankMiddleArgument()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("projectName", "TestProject");
+        params.put("modulePath", "");
+        params.put("methodName", "Foo");
+        String err = JsonUtils.requireArguments(params, "projectName", "modulePath", "methodName");
+        assertNotNull(err);
+        assertTrue(err.contains("modulePath is required"));
+    }
+
+    @Test
+    public void testRequireArgumentsNoNamesReturnsNull()
+    {
+        assertNull(JsonUtils.requireArguments(new HashMap<>()));
+    }
+
     // --- extractBooleanArgument ---
 
     @Test
@@ -143,6 +288,70 @@ public class JsonUtilsTest
         assertEquals(50, JsonUtils.extractIntArgument(params, "limit", 50));
     }
 
+    @Test
+    public void testExtractIntArgumentOutOfRange()
+    {
+        // Beyond Integer.MAX_VALUE -> default (the range guard rejects it).
+        Map<String, String> params = new HashMap<>();
+        params.put("limit", "3000000000");
+        assertEquals(50, JsonUtils.extractIntArgument(params, "limit", 50));
+    }
+
+    // --- extractLongArgument ---
+
+    @Test
+    public void testExtractLongArgumentValid()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("threadId", "42");
+        assertEquals(42L, JsonUtils.extractLongArgument(params, "threadId", -1L));
+    }
+
+    @Test
+    public void testExtractLongArgumentFloat()
+    {
+        // Gson may serialize a JSON integer as "42.0".
+        Map<String, String> params = new HashMap<>();
+        params.put("threadId", "42.0");
+        assertEquals(42L, JsonUtils.extractLongArgument(params, "threadId", -1L));
+    }
+
+    @Test
+    public void testExtractLongArgumentNonInteger()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("threadId", "42.5");
+        assertEquals(-1L, JsonUtils.extractLongArgument(params, "threadId", -1L));
+    }
+
+    @Test
+    public void testExtractLongArgumentInvalid()
+    {
+        Map<String, String> params = new HashMap<>();
+        params.put("threadId", "abc");
+        assertEquals(-1L, JsonUtils.extractLongArgument(params, "threadId", -1L));
+    }
+
+    @Test
+    public void testExtractLongArgumentMissingNullEmpty()
+    {
+        assertEquals(-1L, JsonUtils.extractLongArgument(new HashMap<>(), "threadId", -1L));
+        assertEquals(-1L, JsonUtils.extractLongArgument(null, "threadId", -1L));
+        Map<String, String> params = new HashMap<>();
+        params.put("threadId", "");
+        assertEquals(-1L, JsonUtils.extractLongArgument(params, "threadId", -1L));
+    }
+
+    @Test
+    public void testExtractLongArgumentBeyondIntRange()
+    {
+        // 3_000_000_000 exceeds Integer.MAX_VALUE but is a valid long -> proves it
+        // is parsed as a long, not truncated to int (frameRef/threadId can be large).
+        Map<String, String> params = new HashMap<>();
+        params.put("frameRef", "3000000000");
+        assertEquals(3000000000L, JsonUtils.extractLongArgument(params, "frameRef", -1L));
+    }
+
     // --- extractArrayArgument ---
 
     @Test
@@ -189,6 +398,20 @@ public class JsonUtilsTest
     {
         Map<String, String> params = new HashMap<>();
         assertNull(JsonUtils.extractArrayArgument(params, "missing"));
+    }
+
+    @Test
+    public void testExtractArrayArgumentEmptyJsonArrayYieldsEmptyList()
+    {
+        // An explicit empty JSON array "[]" is a VALID, present value: it must yield an
+        // empty list (NOT null), distinct from an absent param (null). Tools rely on
+        // this to treat [] as "empty filter" the same as a missing param after their
+        // own null-guard.
+        Map<String, String> params = new HashMap<>();
+        params.put("objects", "[]");
+        List<String> result = JsonUtils.extractArrayArgument(params, "objects");
+        assertNotNull(result);
+        assertEquals(0, result.size());
     }
 
     // --- buildJsonRpcError ---

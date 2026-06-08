@@ -6,83 +6,23 @@
 
 package com.ditrix.edt.mcp.server;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-import com.ditrix.edt.mcp.server.protocol.McpConstants;
+import com.ditrix.edt.mcp.server.preferences.PreferenceConstants;
 import com.ditrix.edt.mcp.server.protocol.McpProtocolHandler;
+import com.ditrix.edt.mcp.server.tools.BuiltInToolRegistrar;
 import com.ditrix.edt.mcp.server.tools.McpToolRegistry;
-import com.ditrix.edt.mcp.server.tools.impl.GetBookmarksTool;
-import com.ditrix.edt.mcp.server.tools.impl.DebugLaunchTool;
-import com.ditrix.edt.mcp.server.tools.impl.FindReferencesTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetApplicationsTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetCheckDescriptionTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetConfigurationPropertiesTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetContentAssistTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetEdtVersionTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetFormLayoutSnapshotTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetFormScreenshotTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetMetadataDetailsTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetSymbolInfoTool;
-import com.ditrix.edt.mcp.server.tools.impl.GoToDefinitionTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetMetadataObjectsTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetPlatformDocumentationTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetProblemSummaryTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetProjectErrorsTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetSubsystemContentTool;
-import com.ditrix.edt.mcp.server.tools.impl.ListSubsystemsTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetTagsTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetObjectsByTagsTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetTasksTool;
-import com.ditrix.edt.mcp.server.tools.impl.ListConfigurationsTool;
-import com.ditrix.edt.mcp.server.tools.impl.ListProjectsTool;
-import com.ditrix.edt.mcp.server.tools.impl.CleanProjectTool;
-import com.ditrix.edt.mcp.server.tools.impl.RevalidateObjectsTool;
-import com.ditrix.edt.mcp.server.tools.impl.ExportConfigurationToXmlTool;
-import com.ditrix.edt.mcp.server.tools.impl.ImportConfigurationFromXmlTool;
-import com.ditrix.edt.mcp.server.tools.impl.GenerateTranslationStringsTool;
-import com.ditrix.edt.mcp.server.tools.impl.TranslateConfigurationTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetTranslationProjectInfoTool;
-import com.ditrix.edt.mcp.server.tools.impl.UpdateDatabaseTool;
-import com.ditrix.edt.mcp.server.tools.impl.ReadModuleSourceTool;
-import com.ditrix.edt.mcp.server.tools.impl.WriteModuleSourceTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetModuleStructureTool;
-import com.ditrix.edt.mcp.server.tools.impl.ListModulesTool;
-import com.ditrix.edt.mcp.server.tools.impl.SearchInCodeTool;
-import com.ditrix.edt.mcp.server.tools.impl.ReadMethodSourceTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetMethodCallHierarchyTool;
-import com.ditrix.edt.mcp.server.tools.impl.ValidateQueryTool;
-import com.ditrix.edt.mcp.server.tools.impl.RenameMetadataObjectTool;
-import com.ditrix.edt.mcp.server.tools.impl.RunYaxunitTestsTool;
-import com.ditrix.edt.mcp.server.tools.impl.SetBreakpointTool;
-import com.ditrix.edt.mcp.server.tools.impl.RemoveBreakpointTool;
-import com.ditrix.edt.mcp.server.tools.impl.ListBreakpointsTool;
-import com.ditrix.edt.mcp.server.tools.impl.WaitForBreakTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetVariablesTool;
-import com.ditrix.edt.mcp.server.tools.impl.StartProfilingTool;
-import com.ditrix.edt.mcp.server.tools.impl.StepTool;
-import com.ditrix.edt.mcp.server.tools.impl.TerminateLaunchTool;
-import com.ditrix.edt.mcp.server.tools.impl.ResumeTool;
-import com.ditrix.edt.mcp.server.tools.impl.EvaluateExpressionTool;
-import com.ditrix.edt.mcp.server.tools.impl.DebugStatusTool;
-import com.ditrix.edt.mcp.server.tools.impl.GetProfilingResultsTool;
-import com.ditrix.edt.mcp.server.tools.impl.DebugYaxunitTestsTool;
-import com.ditrix.edt.mcp.server.tools.impl.DeleteMetadataObjectTool;
-import com.ditrix.edt.mcp.server.tools.impl.AddMetadataAttributeTool;
-import com.ditrix.edt.mcp.server.tools.impl.CreateMetadataObjectTool;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpHandler;
+import com.ditrix.edt.mcp.server.transport.HealthHandler;
+import com.ditrix.edt.mcp.server.transport.InterruptibleToolExecutor;
+import com.ditrix.edt.mcp.server.transport.McpHttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
 /**
@@ -150,10 +90,42 @@ public class McpServer
         // Increase max response time to allow large responses (10 minutes)
         System.setProperty("sun.net.httpserver.maxRspTime", "600"); //$NON-NLS-1$ //$NON-NLS-2$
 
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        // Bind to loopback only by default: the tool surface includes arbitrary-BSL
+        // (evaluate_expression) and destructive tools, so it must not be reachable
+        // from the network unless explicitly opted in. Set PREF_ALLOW_REMOTE_ACCESS
+        // to expose on all interfaces (pair it with PREF_AUTH_TOKEN).
+        boolean allowRemote = false;
+        Activator activator = Activator.getDefault();
+        if (activator != null)
+        {
+            allowRemote = activator.getPreferenceStore()
+                .getBoolean(PreferenceConstants.PREF_ALLOW_REMOTE_ACCESS);
+        }
+        InetSocketAddress bindAddress = allowRemote
+            ? new InetSocketAddress(port)
+            : new InetSocketAddress(InetAddress.getLoopbackAddress(), port);
+        server = HttpServer.create(bindAddress, 0);
+        Activator.logInfo("MCP Server binding to " //$NON-NLS-1$
+            + (allowRemote ? "all interfaces (remote access enabled)" : "loopback only") //$NON-NLS-1$ //$NON-NLS-2$
+            + " on port " + port); //$NON-NLS-1$
+        if (allowRemote)
+        {
+            String authToken = activator != null
+                ? activator.getPreferenceStore().getString(PreferenceConstants.PREF_AUTH_TOKEN)
+                : ""; //$NON-NLS-1$
+            if (authToken == null || authToken.isEmpty())
+            {
+                Activator.logWarning("SECURITY: MCP server is bound to all interfaces with NO auth token. " //$NON-NLS-1$
+                    + "Any host that can reach this port can invoke every tool (including arbitrary BSL). " //$NON-NLS-1$
+                    + "Set an auth token in MCP preferences."); //$NON-NLS-1$
+            }
+        }
 
-        // MCP endpoints
-        server.createContext("/mcp", new McpHandler()); //$NON-NLS-1$
+        // MCP endpoints. The transport handlers read the live executors and
+        // execution state back through this server instance.
+        InterruptibleToolExecutor interruptibleExecutor =
+            new InterruptibleToolExecutor(this, protocolHandler);
+        server.createContext("/mcp", new McpHttpHandler(this, protocolHandler, interruptibleExecutor)); //$NON-NLS-1$
         server.createContext("/health", new HealthHandler()); //$NON-NLS-1$
 
         // Main thread pool for POST/OPTIONS/DELETE requests (finite-duration only).
@@ -194,84 +166,7 @@ public class McpServer
      */
     void registerTools()
     {
-        McpToolRegistry registry = McpToolRegistry.getInstance();
-        
-        // Clear existing tools
-        registry.clear();
-        
-        // Register built-in tools
-        registry.register(new GetEdtVersionTool());
-        registry.register(new ListProjectsTool());
-        registry.register(new GetConfigurationPropertiesTool());
-        registry.register(new CleanProjectTool());
-        registry.register(new RevalidateObjectsTool());
-        registry.register(new ExportConfigurationToXmlTool());
-        registry.register(new ImportConfigurationFromXmlTool());
-        registry.register(new GetProblemSummaryTool());
-        registry.register(new GetProjectErrorsTool());
-        registry.register(new GetBookmarksTool());
-        registry.register(new GetTasksTool());
-        registry.register(new GetCheckDescriptionTool());
-        registry.register(new GetContentAssistTool());
-        registry.register(new GetPlatformDocumentationTool());
-        registry.register(new GetMetadataObjectsTool());
-        registry.register(new GetMetadataDetailsTool());
-        registry.register(new ListSubsystemsTool());
-        registry.register(new GetSubsystemContentTool());
-        registry.register(new FindReferencesTool());
-        
-        // Tag tools
-        registry.register(new GetTagsTool());
-        registry.register(new GetObjectsByTagsTool());
-        
-        // Application tools
-        registry.register(new GetApplicationsTool());
-        registry.register(new UpdateDatabaseTool());
-        registry.register(new DebugLaunchTool());
-        registry.register(new ListConfigurationsTool());
-        registry.register(new RunYaxunitTestsTool());
-        registry.register(new TerminateLaunchTool());
-
-        // Debug inspection tools (breakpoints + suspended state)
-        registry.register(new SetBreakpointTool());
-        registry.register(new RemoveBreakpointTool());
-        registry.register(new ListBreakpointsTool());
-        registry.register(new WaitForBreakTool());
-        registry.register(new GetVariablesTool());
-        registry.register(new StepTool());
-        registry.register(new ResumeTool());
-        registry.register(new EvaluateExpressionTool());
-        registry.register(new DebugYaxunitTestsTool());
-        registry.register(new DebugStatusTool());
-        registry.register(new StartProfilingTool());
-        registry.register(new GetProfilingResultsTool());
-
-        // BSL code analysis tools
-        registry.register(new ReadModuleSourceTool());
-        registry.register(new WriteModuleSourceTool());
-        registry.register(new GetModuleStructureTool());
-        registry.register(new ListModulesTool());
-        registry.register(new SearchInCodeTool());
-        registry.register(new ReadMethodSourceTool());
-        registry.register(new GetMethodCallHierarchyTool());
-        registry.register(new GoToDefinitionTool());
-        registry.register(new GetSymbolInfoTool());
-        registry.register(new GetFormLayoutSnapshotTool());
-        registry.register(new GetFormScreenshotTool());
-        registry.register(new ValidateQueryTool());
-
-        // Metadata refactoring tools
-        registry.register(new RenameMetadataObjectTool());
-        registry.register(new DeleteMetadataObjectTool());
-        registry.register(new AddMetadataAttributeTool());
-        registry.register(new CreateMetadataObjectTool());
-
-        // LanguageTool translation tools
-        registry.register(new GenerateTranslationStringsTool());
-        registry.register(new TranslateConfigurationTool());
-        registry.register(new GetTranslationProjectInfoTool());
-
-        Activator.logInfo("Registered " + registry.getToolCount() + " MCP tools"); //$NON-NLS-1$ //$NON-NLS-2$
+        BuiltInToolRegistrar.registerAll(McpToolRegistry.getInstance());
     }
 
     /**
@@ -328,6 +223,28 @@ public class McpServer
     public int getPort()
     {
         return port;
+    }
+
+    /**
+     * Returns the main request thread pool (POST/OPTIONS/DELETE). Used by the
+     * transport handler for admission control. May be {@code null} when stopped.
+     *
+     * @return the main executor or null
+     */
+    public ThreadPoolExecutor getMainExecutor()
+    {
+        return mainExecutor;
+    }
+
+    /**
+     * Returns the dedicated SSE thread pool. Used by the transport handler to
+     * offload long-lived SSE streams. May be {@code null} when stopped.
+     *
+     * @return the SSE executor or null
+     */
+    public ExecutorService getSseExecutor()
+    {
+        return sseExecutor;
     }
 
     /**
@@ -470,620 +387,5 @@ public class McpServer
             return sent;
         }
         return false;
-    }
-
-    /**
-     * MCP request handler.
-     * Implements Streamable HTTP transport as per MCP 2025-11-25 specification.
-     */
-    private class McpHandler implements HttpHandler
-    {
-        /** Event ID counter for SSE */
-        private long eventIdCounter = 0;
-        
-        @Override
-        public void handle(HttpExchange exchange) throws IOException
-        {
-            // SSE GET streams are offloaded to a dedicated pool so they never
-            // occupy threads in the main request pool or block the dispatcher.
-            String method = exchange.getRequestMethod();
-            if ("GET".equals(method)) //$NON-NLS-1$
-            {
-                handleSseInDedicatedPool(exchange);
-                return;
-            }
-
-            try
-            {
-                // Admission control: shed load before doing heavy work.
-                // Unbounded queue prevents connection resets (no executor rejection),
-                // and this check returns fast 503 to drain the queue under pressure.
-                if (mainExecutor != null)
-                {
-                    int queued = mainExecutor.getQueue().size();
-                    int active = mainExecutor.getActiveCount();
-                    if (queued + active > 50)
-                    {
-                        Activator.logInfo("Main pool overloaded (active=" + active //$NON-NLS-1$
-                            + ", queued=" + queued + "), returning 503"); //$NON-NLS-1$
-                        exchange.getResponseHeaders().add("Retry-After", "2"); //$NON-NLS-1$ //$NON-NLS-2$
-                        sendResponse(exchange, 503,
-                            com.ditrix.edt.mcp.server.protocol.JsonUtils.buildSimpleError("Server overloaded, retry later")); //$NON-NLS-1$
-                        return;
-                    }
-                }
-
-                // Validate Origin and add CORS headers
-                if (!addCorsHeaders(exchange))
-                {
-                    String origin = exchange.getRequestHeaders().getFirst("Origin"); //$NON-NLS-1$
-                    Activator.logInfo("Invalid Origin header rejected: " + origin); //$NON-NLS-1$
-                    sendResponse(exchange, 403, com.ditrix.edt.mcp.server.protocol.JsonUtils.buildJsonRpcError(
-                        McpConstants.ERROR_INVALID_REQUEST, "Invalid Origin", null)); //$NON-NLS-1$
-                    return;
-                }
-
-                // Handle CORS preflight request
-                if ("OPTIONS".equals(method)) //$NON-NLS-1$
-                {
-                    exchange.sendResponseHeaders(204, -1);
-                    return;
-                }
-
-                if ("POST".equals(method)) //$NON-NLS-1$
-                {
-                    handleMcpRequest(exchange);
-                }
-                else if ("DELETE".equals(method)) //$NON-NLS-1$
-                {
-                    // Session termination - accept but we don't track sessions currently
-                    sendResponse(exchange, 200, ""); //$NON-NLS-1$
-                }
-                else
-                {
-                    sendResponse(exchange, 405, com.ditrix.edt.mcp.server.protocol.JsonUtils.buildSimpleError("Method not allowed")); //$NON-NLS-1$
-                }
-            }
-            catch (IOException e)
-            {
-                // Client disconnected unexpectedly - log and clean up
-                Activator.logInfo("Client connection lost: " + e.getMessage()); //$NON-NLS-1$
-            }
-            catch (Exception e)
-            {
-                Activator.logError("Unexpected error handling MCP request", e); //$NON-NLS-1$
-                try
-                {
-                    sendResponse(exchange, 500, com.ditrix.edt.mcp.server.protocol.JsonUtils.buildJsonRpcError(
-                        McpConstants.ERROR_INTERNAL, "Internal server error", null)); //$NON-NLS-1$
-                }
-                catch (IOException ioe)
-                {
-                    // Client already disconnected, nothing to do
-                    Activator.logInfo("Failed to send error response, client disconnected"); //$NON-NLS-1$
-                }
-            }
-            finally
-            {
-                try
-                {
-                    exchange.close();
-                }
-                catch (Exception ignored)
-                {
-                    // Already closed
-                }
-            }
-        }
-
-        /**
-         * Offloads SSE GET handling to the dedicated SSE thread pool.
-         * The exchange lifecycle (including close) is managed entirely by the SSE thread,
-         * so the main pool thread is released immediately.
-         */
-        private void handleSseInDedicatedPool(HttpExchange exchange)
-        {
-            ExecutorService sse = sseExecutor;
-            if (sse == null || sse.isShutdown())
-            {
-                try
-                {
-                    sendResponse(exchange, 503,
-                        com.ditrix.edt.mcp.server.protocol.JsonUtils.buildSimpleError("Server is shutting down")); //$NON-NLS-1$
-                }
-                catch (IOException e)
-                {
-                    // ignore
-                }
-                finally
-                {
-                    exchange.close();
-                }
-                return;
-            }
-
-            try
-            {
-                sse.submit(() -> {
-                    try
-                    {
-                        // Validate Origin and add CORS headers
-                        if (!addCorsHeaders(exchange))
-                        {
-                            sendResponse(exchange, 403,
-                                com.ditrix.edt.mcp.server.protocol.JsonUtils.buildJsonRpcError(
-                                    McpConstants.ERROR_INVALID_REQUEST, "Invalid Origin", null)); //$NON-NLS-1$
-                            return;
-                        }
-                        handleSseStream(exchange);
-                    }
-                    catch (IOException e)
-                    {
-                        Activator.logInfo("SSE client connection lost: " + e.getMessage()); //$NON-NLS-1$
-                    }
-                    catch (Exception e)
-                    {
-                        Activator.logError("Unexpected error in SSE stream", e); //$NON-NLS-1$
-                    }
-                    finally
-                    {
-                        try
-                        {
-                            exchange.close();
-                        }
-                        catch (Exception ignored)
-                        {
-                            // Already closed
-                        }
-                    }
-                });
-            }
-            catch (RejectedExecutionException e)
-            {
-                // SSE pool shutting down
-                try
-                {
-                    sendResponse(exchange, 503,
-                        com.ditrix.edt.mcp.server.protocol.JsonUtils.buildSimpleError("Server overloaded")); //$NON-NLS-1$
-                }
-                catch (IOException ioe)
-                {
-                    // ignore
-                }
-                finally
-                {
-                    exchange.close();
-                }
-            }
-        }
-        
-        private void handleMcpRequest(HttpExchange exchange) throws IOException
-        {
-            // Increment request counter
-            incrementRequestCount();
-
-            Activator.logInfo("MCP request received from " + exchange.getRemoteAddress()); //$NON-NLS-1$
-
-            // Read request body
-            String requestBody;
-            try
-            {
-                StringBuilder body = new StringBuilder();
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(exchange.getRequestBody(), StandardCharsets.UTF_8)))
-                {
-                    String line;
-                    while ((line = reader.readLine()) != null)
-                    {
-                        body.append(line);
-                    }
-                }
-                requestBody = body.toString();
-            }
-            catch (IOException e)
-            {
-                Activator.logInfo("Connection lost while reading request body: " + e.getMessage()); //$NON-NLS-1$
-                return;
-            }
-
-            Activator.logInfo("MCP request body: " + requestBody); //$NON-NLS-1$
-
-            String response;
-            boolean isInitialize = requestBody.contains("\"" + McpConstants.METHOD_INITIALIZE + "\""); //$NON-NLS-1$ //$NON-NLS-2$
-            boolean isToolCall = requestBody.contains("\"" + McpConstants.METHOD_TOOLS_CALL + "\""); //$NON-NLS-1$ //$NON-NLS-2$
-
-            try
-            {
-                if (isToolCall)
-                {
-                    // Handle tool calls with interruptible execution
-                    response = handleInterruptibleToolCall(exchange, requestBody);
-                    if (response == null)
-                    {
-                        // Response was already sent (user interrupted)
-                        return;
-                    }
-                }
-                else
-                {
-                    response = protocolHandler.processRequest(requestBody);
-                }
-
-                // null response means notification (no response needed)
-                if (response == null)
-                {
-                    Activator.logInfo("MCP notification processed, returning 202"); //$NON-NLS-1$
-                    exchange.sendResponseHeaders(202, -1);
-                    return;
-                }
-
-                Activator.logInfo("MCP response: " + response.substring(0, Math.min(200, response.length())) + "..."); //$NON-NLS-1$ //$NON-NLS-2$
-            }
-            catch (Exception e)
-            {
-                Activator.logError("MCP request processing error", e); //$NON-NLS-1$
-                response = com.ditrix.edt.mcp.server.protocol.JsonUtils.buildJsonRpcError(
-                    McpConstants.ERROR_INTERNAL, e.getMessage(), null);
-            }
-
-            // Check if client accepts SSE
-            String acceptHeader = exchange.getRequestHeaders().getFirst("Accept"); //$NON-NLS-1$
-            boolean acceptsSse = acceptHeader != null && acceptHeader.contains("text/event-stream"); //$NON-NLS-1$
-
-            if (acceptsSse)
-            {
-                // Send response as SSE event
-                sendSseResponse(exchange, response, isInitialize);
-            }
-            else
-            {
-                // Send as plain JSON - add session header for initialize
-                if (isInitialize)
-                {
-                    exchange.getResponseHeaders().add(McpConstants.HEADER_SESSION_ID, generateSessionId());
-                }
-                exchange.getResponseHeaders().add("Content-Type", "application/json"); //$NON-NLS-1$ //$NON-NLS-2$
-                exchange.getResponseHeaders().add("Connection", "keep-alive"); //$NON-NLS-1$ //$NON-NLS-2$
-                sendResponse(exchange, 200, response);
-            }
-        }
-        
-        /**
-         * Handles tool call with support for user interruption.
-         * Runs tool execution in a separate thread and monitors for user signals.
-         * 
-         * @param exchange the HTTP exchange
-         * @param requestBody the request body
-         * @return the response, or null if response was already sent (interrupted)
-         */
-        private String handleInterruptibleToolCall(HttpExchange exchange, String requestBody) throws Exception
-        {
-            // Extract request ID and tool name for ActiveToolCall
-            Object requestId = extractRequestId(requestBody);
-            String toolName = extractToolName(requestBody);
-            
-            // Create and register active tool call
-            ActiveToolCall activeCall = new ActiveToolCall(exchange, toolName, requestId);
-            setActiveToolCall(activeCall);
-            
-            // Use a container to hold the result from the background thread
-            final String[] resultContainer = new String[1];
-            final Exception[] errorContainer = new Exception[1];
-            final boolean[] completedFlag = new boolean[1];
-            
-            // Run tool execution in background thread
-            Thread executionThread = new Thread(() -> {
-                try
-                {
-                    resultContainer[0] = protocolHandler.processRequest(requestBody);
-                }
-                catch (Exception e)
-                {
-                    errorContainer[0] = e;
-                }
-                finally
-                {
-                    synchronized (completedFlag)
-                    {
-                        completedFlag[0] = true;
-                        completedFlag.notifyAll();
-                    }
-                }
-            }, "MCP-Tool-Executor"); //$NON-NLS-1$
-            
-            executionThread.start();
-            
-            // Wait for completion or user signal
-            synchronized (completedFlag)
-            {
-                while (!completedFlag[0])
-                {
-                    try
-                    {
-                        // Check every 100ms for signals
-                        completedFlag.wait(100);
-                        
-                        // Check if user sent an interrupt signal
-                        if (activeCall.hasResponded())
-                        {
-                            // User already sent a response, don't send another
-                            clearActiveToolCall();
-                            return null;
-                        }
-                    }
-                    catch (InterruptedException e)
-                    {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-            }
-            
-            // Clear active tool call
-            clearActiveToolCall();
-            
-            // Check if response was already sent while we were waiting
-            if (activeCall.hasResponded())
-            {
-                return null;
-            }
-            
-            // Return result or throw error
-            if (errorContainer[0] != null)
-            {
-                throw errorContainer[0];
-            }
-            
-            return resultContainer[0];
-        }
-        
-        /**
-         * Extracts request ID from JSON-RPC request using Gson.
-         */
-        private Object extractRequestId(String requestBody)
-        {
-            try
-            {
-                com.google.gson.JsonElement element = com.google.gson.JsonParser.parseString(requestBody);
-                if (element.isJsonObject())
-                {
-                    com.google.gson.JsonObject jsonObject = element.getAsJsonObject();
-                    if (jsonObject.has("id")) //$NON-NLS-1$
-                    {
-                        com.google.gson.JsonElement idElement = jsonObject.get("id"); //$NON-NLS-1$
-                        if (idElement.isJsonPrimitive())
-                        {
-                            com.google.gson.JsonPrimitive primitive = idElement.getAsJsonPrimitive();
-                            if (primitive.isString())
-                            {
-                                return primitive.getAsString();
-                            }
-                            else if (primitive.isNumber())
-                            {
-                                return primitive.getAsLong();
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Activator.logError("Failed to extract request ID", e); //$NON-NLS-1$
-            }
-            return null;
-        }
-        
-        /**
-         * Extracts tool name from tools/call request using Gson.
-         */
-        private String extractToolName(String requestBody)
-        {
-            try
-            {
-                com.google.gson.JsonElement element = com.google.gson.JsonParser.parseString(requestBody);
-                if (element.isJsonObject())
-                {
-                    com.google.gson.JsonObject jsonObject = element.getAsJsonObject();
-                    if (jsonObject.has("params")) //$NON-NLS-1$
-                    {
-                        com.google.gson.JsonObject params = jsonObject.getAsJsonObject("params"); //$NON-NLS-1$
-                        if (params.has("name")) //$NON-NLS-1$
-                        {
-                            return params.get("name").getAsString(); //$NON-NLS-1$
-                        }
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Activator.logError("Failed to extract tool name", e); //$NON-NLS-1$
-            }
-            return "unknown"; //$NON-NLS-1$
-        }
-        
-        /**
-         * Generates a simple session ID.
-         */
-        private String generateSessionId()
-        {
-            return java.util.UUID.randomUUID().toString();
-        }
-        
-        /**
-         * Sends response as SSE event stream.
-         * As per MCP 2025-11-25: should include event ID for reconnection.
-         */
-        private void sendSseResponse(HttpExchange exchange, String response, boolean isInitialize) throws IOException
-        {
-            exchange.getResponseHeaders().add("Content-Type", "text/event-stream"); //$NON-NLS-1$ //$NON-NLS-2$
-            exchange.getResponseHeaders().add("Cache-Control", "no-cache"); //$NON-NLS-1$ //$NON-NLS-2$
-            exchange.getResponseHeaders().add("Connection", "keep-alive"); //$NON-NLS-1$ //$NON-NLS-2$
-            
-            // Add session ID for initialize response
-            if (isInitialize)
-            {
-                exchange.getResponseHeaders().add(McpConstants.HEADER_SESSION_ID, generateSessionId());
-            }
-            
-            // Build SSE message with event ID (per 2025-11-25 spec)
-            long eventId = ++eventIdCounter;
-            StringBuilder sseMessage = new StringBuilder();
-            sseMessage.append("event: message\n"); //$NON-NLS-1$
-            sseMessage.append("id: ").append(eventId).append("\n"); //$NON-NLS-1$ //$NON-NLS-2$
-            sseMessage.append("data: ").append(response).append("\n\n"); //$NON-NLS-1$ //$NON-NLS-2$
-            
-            byte[] bytes = sseMessage.toString().getBytes(StandardCharsets.UTF_8);
-            
-            exchange.sendResponseHeaders(200, bytes.length);
-            try (OutputStream os = exchange.getResponseBody())
-            {
-                os.write(bytes);
-                os.flush();
-            }
-        }
-        
-        /**
-         * Handles GET request for SSE stream.
-         * As per MCP Streamable HTTP spec: supports SSE GET for clients like LM Studio
-         * that require an established SSE stream before sending POST requests.
-         * The server keeps the connection alive with periodic heartbeats.
-         */
-        private void handleSseStream(HttpExchange exchange) throws IOException
-        {
-            String acceptHeader = exchange.getRequestHeaders().getFirst("Accept"); //$NON-NLS-1$
-            
-            if (acceptHeader != null && acceptHeader.contains("text/event-stream")) //$NON-NLS-1$
-            {
-                Activator.logInfo("SSE GET request received - opening SSE stream"); //$NON-NLS-1$
-                
-                exchange.getResponseHeaders().add("Content-Type", "text/event-stream"); //$NON-NLS-1$ //$NON-NLS-2$
-                exchange.getResponseHeaders().add("Cache-Control", "no-cache"); //$NON-NLS-1$ //$NON-NLS-2$
-                exchange.getResponseHeaders().add("Connection", "keep-alive"); //$NON-NLS-1$ //$NON-NLS-2$
-                exchange.sendResponseHeaders(200, 0);
-                
-                // Keep SSE stream open with periodic heartbeat comments
-                try (java.io.OutputStream os = exchange.getResponseBody())
-                {
-                    while (!Thread.currentThread().isInterrupted())
-                    {
-                        try
-                        {
-                            byte[] heartbeat = ": keep-alive\n\n".getBytes(StandardCharsets.UTF_8); //$NON-NLS-1$
-                            os.write(heartbeat);
-                            os.flush();
-                            Thread.sleep(5000);
-                        }
-                        catch (InterruptedException e)
-                        {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                        catch (IOException e)
-                        {
-                            // Client disconnected
-                            break;
-                        }
-                    }
-                }
-                catch (IOException e)
-                {
-                    // Client disconnected before headers were sent
-                }
-                Activator.logInfo("SSE stream closed"); //$NON-NLS-1$
-            }
-            else
-            {
-                // Return server info for plain GET requests
-                String response = com.ditrix.edt.mcp.server.protocol.JsonUtils.buildServerInfo(
-                    McpConstants.SERVER_NAME,
-                    McpConstants.PLUGIN_VERSION,
-                    GetEdtVersionTool.getEdtVersion(),
-                    McpConstants.PROTOCOL_VERSION);
-                exchange.getResponseHeaders().add("Content-Type", "application/json"); //$NON-NLS-1$ //$NON-NLS-2$
-                sendResponse(exchange, 200, response);
-            }
-        }
-    }
-
-    /**
-     * Validates Origin header for security.
-     * Allows localhost origins, file:// origins, and "null" (for local file HTML).
-     * 
-     * @param origin the Origin header value
-     * @return true if origin is allowed
-     */
-    private static boolean isValidOrigin(String origin)
-    {
-        return origin.startsWith("http://localhost") || //$NON-NLS-1$
-               origin.startsWith("http://127.0.0.1") || //$NON-NLS-1$
-               origin.startsWith("https://localhost") || //$NON-NLS-1$
-               origin.startsWith("https://127.0.0.1") || //$NON-NLS-1$
-               origin.startsWith("file://") || //$NON-NLS-1$
-               origin.equals("null") || //$NON-NLS-1$ // Local HTML files send "null" as origin
-               origin.startsWith("vscode-webview://"); //$NON-NLS-1$
-    }
-
-    /**
-     * Adds CORS headers to the HTTP exchange if Origin is present.
-     * Validates the origin and returns false if it's not allowed.
-     * 
-     * @param exchange the HTTP exchange
-     * @return true if origin is allowed (or absent), false if origin is invalid
-     */
-    private boolean addCorsHeaders(HttpExchange exchange)
-    {
-        String origin = exchange.getRequestHeaders().getFirst("Origin"); //$NON-NLS-1$
-        if (origin != null)
-        {
-            if (!isValidOrigin(origin))
-            {
-                return false;
-            }
-            exchange.getResponseHeaders().add("Access-Control-Allow-Origin", origin); //$NON-NLS-1$
-            exchange.getResponseHeaders().add("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"); //$NON-NLS-1$ //$NON-NLS-2$
-            exchange.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type, Accept"); //$NON-NLS-1$ //$NON-NLS-2$
-        }
-        return true;
-    }
-
-    /**
-     * Server health check handler.
-     */
-    private class HealthHandler implements HttpHandler
-    {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException
-        {
-            // Add CORS headers for health check
-            addCorsHeaders(exchange);
-            
-            // Handle OPTIONS preflight
-            if ("OPTIONS".equals(exchange.getRequestMethod())) //$NON-NLS-1$
-            {
-                exchange.sendResponseHeaders(204, -1);
-                exchange.close();
-                return;
-            }
-            
-            String response = com.ditrix.edt.mcp.server.protocol.JsonUtils.buildHealthResponse(GetEdtVersionTool.getEdtVersion());
-            exchange.getResponseHeaders().add("Content-Type", "application/json"); //$NON-NLS-1$ //$NON-NLS-2$
-            sendResponse(exchange, 200, response);
-        }
-    }
-
-    private void sendResponse(HttpExchange exchange, int statusCode, String response) throws IOException
-    {
-        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-        try (OutputStream os = exchange.getResponseBody())
-        {
-            os.write(bytes);
-            os.flush();
-        }
-        catch (IOException e)
-        {
-            Activator.logInfo("Connection lost while sending response: " + e.getMessage()); //$NON-NLS-1$
-            throw e;
-        }
     }
 }

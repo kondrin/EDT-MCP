@@ -12,9 +12,7 @@ import java.util.Map;
 
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
-import org.eclipse.core.resources.IWorkspace;
 import org.eclipse.core.resources.IncrementalProjectBuilder;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.NullProgressMonitor;
@@ -29,6 +27,7 @@ import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.BuildUtils;
 import com.ditrix.edt.mcp.server.utils.LifecycleWaiter;
 import com.ditrix.edt.mcp.server.utils.LifecycleWaiter.ProjectRestartWaiter;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 
 /**
@@ -63,25 +62,37 @@ public class CleanProjectTool implements IMcpTool
             .stringProperty("projectName", "Name of the project to clean (optional, cleans all EDT projects if not specified)") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
     }
-    
+
+    @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .integerProperty("projectsCleaned", "Number of projects that were cleaned") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringArrayProperty("projects", "Names of the projects that were cleaned") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("message", "Human-readable completion message") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
     @Override
     public ResponseType getResponseType()
     {
         return ResponseType.JSON;
     }
-    
+
     @Override
     public String execute(Map<String, String> params)
     {
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         
-        // Check if project is ready for operations
+        // Refuse only the transient BUILDING state; a missing/closed project
+        // falls through to the value-naming "Project not found" below.
         if (projectName != null && !projectName.isEmpty())
         {
-            String notReadyError = ProjectStateChecker.checkReadyOrError(projectName);
-            if (notReadyError != null)
+            String building = ProjectStateChecker.buildingErrorOrNull(projectName);
+            if (building != null)
             {
-                return ToolResult.error(notReadyError).toJson();
+                return ToolResult.error(building).toJson();
             }
         }
         
@@ -101,7 +112,6 @@ public class CleanProjectTool implements IMcpTool
     {
         try
         {
-            IWorkspace workspace = ResourcesPlugin.getWorkspace();
             IProgressMonitor monitor = new NullProgressMonitor();
             IDtProjectManager dtProjectManager = Activator.getDefault().getDtProjectManager();
             
@@ -111,17 +121,19 @@ public class CleanProjectTool implements IMcpTool
             if (projectName != null && !projectName.isEmpty())
             {
                 // Clean specific project
-                IProject project = workspace.getRoot().getProject(projectName);
-                if (project == null || !project.exists())
+                ProjectContext ctx = ProjectContext.of(projectName);
+                if (!ctx.exists())
                 {
-                    return ToolResult.error("Project not found: " + projectName).toJson(); //$NON-NLS-1$
+                    return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
                 }
-                
-                if (!project.isOpen())
+
+                if (!ctx.isOpen())
                 {
                     return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
                 }
-                
+
+                IProject project = ctx.project();
+
                 IDtProject dtProject = dtProjectManager != null ? 
                     dtProjectManager.getDtProject(project) : null;
                 

@@ -78,6 +78,33 @@ public final class PreferenceConstants
     /** Default: all tools enabled (empty string = no disabled tools) */
     public static final String DEFAULT_DISABLED_TOOLS = ""; //$NON-NLS-1$
 
+    // === Progressive tool disclosure (dynamic toolsets) ===
+
+    /**
+     * Progressive tool disclosure: when on, {@code tools/list} exposes only the
+     * core toolset (plus toolsets enabled at runtime via {@code enable_toolset}),
+     * shrinking the always-loaded surface. When off (default), every enabled tool
+     * is listed exactly as before.
+     */
+    public static final String PREF_PROGRESSIVE_DISCLOSURE = "mcpProgressiveDisclosure"; //$NON-NLS-1$
+
+    /** Default: progressive disclosure off (full tool list, no behavior change). */
+    public static final boolean DEFAULT_PROGRESSIVE_DISCLOSURE = false;
+
+    // === Security preferences ===
+
+    /** Allow remote (non-loopback) access: bind to all interfaces instead of 127.0.0.1 */
+    public static final String PREF_ALLOW_REMOTE_ACCESS = "mcpAllowRemoteAccess"; //$NON-NLS-1$
+
+    /** Shared auth token; an empty value disables authentication */
+    public static final String PREF_AUTH_TOKEN = "mcpAuthToken"; //$NON-NLS-1$
+
+    /** Default: loopback-only bind (secure) */
+    public static final boolean DEFAULT_ALLOW_REMOTE_ACCESS = false;
+
+    /** Default auth token (empty = authentication disabled) */
+    public static final String DEFAULT_AUTH_TOKEN = ""; //$NON-NLS-1$
+
     private PreferenceConstants()
     {
         // Utility class

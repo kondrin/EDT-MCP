@@ -39,8 +39,110 @@ public class ToolCallResultTest
         assertNotNull(result.getContent());
         assertEquals(1, result.getContent().size());
         assertEquals("text", result.getContent().get(0).getType());
-        assertEquals("Done", result.getContent().get(0).getText());
+        // The success content fallback is now a non-empty digest, not "Done".
+        String text = result.getContent().get(0).getText();
+        assertNotNull(text);
+        assertFalse("success digest must not be empty", text.isEmpty());
+        assertNotEquals("success digest must not be the opaque \"Done\"", "Done", text);
         assertNotNull(result.getStructuredContent());
+    }
+
+    @Test
+    public void testJsonErrorResultSetsIsError()
+    {
+        JsonElement structured = JsonParser.parseString("{\"success\":false,\"error\":\"boom\"}");
+        ToolCallResult result = ToolCallResult.json(structured, true);
+
+        assertEquals(Boolean.TRUE, result.getIsError());
+        // The content text now carries the REAL error message (from the payload's
+        // error field), so a content-only client/model sees WHY it failed — not a
+        // bare "Error" placeholder.
+        assertEquals("boom", result.getContent().get(0).getText());
+
+        String json = GsonProvider.toJson(result);
+        JsonElement element = JsonParser.parseString(json);
+        assertTrue("error result must carry isError:true",
+            element.getAsJsonObject().get("isError").getAsBoolean());
+    }
+
+    @Test
+    public void testJsonSuccessOmitsIsError()
+    {
+        JsonElement structured = JsonParser.parseString("{\"count\":42}");
+        ToolCallResult result = ToolCallResult.json(structured);
+
+        assertNull(result.getIsError());
+        // Success content is a digest, never the opaque "Done".
+        assertNotEquals("Done", result.getContent().get(0).getText());
+
+        String json = GsonProvider.toJson(result);
+        JsonElement element = JsonParser.parseString(json);
+        assertFalse("success result must not carry isError",
+            element.getAsJsonObject().has("isError"));
+    }
+
+    @Test
+    public void testJsonSuccessDigestSummarizesObject()
+    {
+        // The digest is derived from the structured content: it names the
+        // top-level keys and the size of the primary (first array) collection,
+        // so a content-only client still sees something meaningful.
+        JsonElement structured = JsonParser.parseString(
+            "{\"project\":\"Demo\",\"modules\":[1,2,3]}");
+        ToolCallResult result = ToolCallResult.json(structured);
+
+        String text = result.getContent().get(0).getText();
+        assertTrue("digest should mention the array count", text.contains("modules: 3"));
+        assertTrue("digest should list the keys", text.contains("project"));
+        // structuredContent must remain the full, untouched data.
+        assertSame(structured, result.getStructuredContent());
+    }
+
+    @Test
+    public void testJsonSuccessDigestIsBounded()
+    {
+        // A large payload must not blow up the content fallback: the digest is
+        // capped (~500 chars) and ends with an ellipsis when truncated.
+        StringBuilder big = new StringBuilder("{");
+        for (int i = 0; i < 400; i++)
+        {
+            if (i > 0)
+            {
+                big.append(",");
+            }
+            big.append("\"averyverylongkeyname").append(i).append("\":").append(i);
+        }
+        big.append("}");
+        JsonElement structured = JsonParser.parseString(big.toString());
+        ToolCallResult result = ToolCallResult.json(structured);
+
+        String text = result.getContent().get(0).getText();
+        assertTrue("digest must be bounded", text.length() <= 500);
+        assertTrue("truncated digest must end with an ellipsis",
+            text.endsWith(String.valueOf((char)0x2026)));
+        // The full data is still intact in structuredContent.
+        assertEquals(400, structured.getAsJsonObject().size());
+    }
+
+    @Test
+    public void testJsonErrorContentCarriesRealMessage()
+    {
+        // The failure content fallback is the real error message (the payload's
+        // error field), never a success digest and never a bare "Error" placeholder.
+        JsonElement structured = JsonParser.parseString("{\"success\":false,\"error\":\"boom\"}");
+        ToolCallResult result = ToolCallResult.json(structured, true);
+
+        assertEquals("boom", result.getContent().get(0).getText());
+    }
+
+    @Test
+    public void testJsonErrorWithoutMessageFallsBackToError()
+    {
+        // No usable error string in the payload -> the literal "Error" fallback.
+        JsonElement structured = JsonParser.parseString("{\"success\":false}");
+        ToolCallResult result = ToolCallResult.json(structured, true);
+
+        assertEquals("Error", result.getContent().get(0).getText());
     }
 
     @Test

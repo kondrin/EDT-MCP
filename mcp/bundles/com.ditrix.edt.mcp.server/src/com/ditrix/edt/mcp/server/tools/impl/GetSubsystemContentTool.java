@@ -15,7 +15,6 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
 
@@ -26,8 +25,11 @@ import com._1c.g5.v8.dt.metadata.mdclass.Subsystem;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
+import com.ditrix.edt.mcp.server.utils.SubsystemUtils;
 
 /**
  * Tool to get detailed content of a specific 1C subsystem: properties, the list of
@@ -46,13 +48,11 @@ public class GetSubsystemContentTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Get content of a specific 1C subsystem: basic properties, " //$NON-NLS-1$
-            + "list of metadata objects included in the subsystem (Type/Name/Synonym/FQN), " //$NON-NLS-1$
-            + "and nested child subsystems. Subsystem is identified by FQN " //$NON-NLS-1$
-            + "(e.g. 'Subsystem.Sales' or 'Subsystem.Sales.Subsystem.Orders'). " //$NON-NLS-1$
-            + "Returns content of the requested subsystem only by default (recursive=false) " //$NON-NLS-1$
-            + "to keep the response compact; set recursive=true to also include " //$NON-NLS-1$
-            + "objects from nested subsystems (deduplicated)."; //$NON-NLS-1$
+        return "Get one 1C subsystem's content: properties, its metadata objects " //$NON-NLS-1$
+            + "(Type/Name/Synonym/FQN) and child subsystems, identified by FQN " //$NON-NLS-1$
+            + "(e.g. 'Subsystem.Sales.Subsystem.Orders'). " //$NON-NLS-1$
+            + "By default lists only this subsystem's objects; set recursive=true to fold in nested ones. " //$NON-NLS-1$
+            + "Full parameters and examples: call get_tool_guide('get_subsystem_content')."; //$NON-NLS-1$
     }
 
     @Override
@@ -62,12 +62,12 @@ public class GetSubsystemContentTool implements IMcpTool
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringProperty("subsystemFqn", //$NON-NLS-1$
-                "Subsystem FQN (required), e.g. 'Subsystem.Sales' or 'Subsystem.Sales.Subsystem.Orders'", //$NON-NLS-1$
+                "Subsystem FQN (required), e.g. 'Subsystem.Sales.Subsystem.Orders'", //$NON-NLS-1$
                 true)
             .booleanProperty("recursive", //$NON-NLS-1$
-                "Include objects from nested subsystems in the Content section (default: false)") //$NON-NLS-1$
+                "Also include objects from nested subsystems (default: false)") //$NON-NLS-1$
             .stringProperty("language", //$NON-NLS-1$
-                "Language code for synonyms (e.g. 'en', 'ru'). Uses configuration default if not specified.") //$NON-NLS-1$
+                "Synonym language code, e.g. 'en'/'ru' (default: configuration default)") //$NON-NLS-1$
             .build();
     }
 
@@ -92,17 +92,20 @@ public class GetSubsystemContentTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
+        {
+            return err;
+        }
+
         String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
         String subsystemFqn = JsonUtils.extractStringArgument(params, "subsystemFqn"); //$NON-NLS-1$
         String language = JsonUtils.extractStringArgument(params, "language"); //$NON-NLS-1$
 
-        if (projectName == null || projectName.isEmpty())
+        err = JsonUtils.requireArgument(params, "subsystemFqn", " (e.g. 'Subsystem.Sales')"); //$NON-NLS-1$ //$NON-NLS-2$
+        if (err != null)
         {
-            return "Error: projectName is required"; //$NON-NLS-1$
-        }
-        if (subsystemFqn == null || subsystemFqn.isEmpty())
-        {
-            return "Error: subsystemFqn is required (e.g. 'Subsystem.Sales')"; //$NON-NLS-1$
+            return err;
         }
 
         boolean recursive = JsonUtils.extractBooleanArgument(params, "recursive", false); //$NON-NLS-1$
@@ -121,7 +124,7 @@ public class GetSubsystemContentTool implements IMcpTool
             catch (Exception e)
             {
                 Activator.logError("Error getting subsystem content", e); //$NON-NLS-1$
-                resultRef.set("Error: " + e.getMessage()); //$NON-NLS-1$
+                resultRef.set(ToolResult.error(e.getMessage()).toJson());
             }
         });
 
@@ -131,28 +134,31 @@ public class GetSubsystemContentTool implements IMcpTool
     private String getSubsystemContentInternal(String projectName, String subsystemFqn,
         boolean recursive, String language)
     {
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
 
         IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
         if (configProvider == null)
         {
-            return "Error: Configuration provider not available"; //$NON-NLS-1$
+            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
         }
 
         Configuration config = configProvider.getConfiguration(project);
         if (config == null)
         {
-            return "Error: Could not get configuration for project: " + projectName; //$NON-NLS-1$
+            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
         }
 
         Subsystem subsystem = SubsystemUtils.resolveByFqn(config, subsystemFqn);
         if (subsystem == null)
         {
-            return "Error: Subsystem not found: " + subsystemFqn; //$NON-NLS-1$
+            return ToolResult.error("Subsystem not found: " + subsystemFqn //$NON-NLS-1$
+                + ". Check the FQN is 'Subsystem.<Name>' (type token must be 'Subsystem'); " //$NON-NLS-1$
+                + "use list_subsystems to see available subsystems.").toJson(); //$NON-NLS-1$
         }
 
         String effectiveLanguage = SubsystemUtils.resolveLanguage(language, config);

@@ -12,7 +12,6 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.emf.common.util.EMap;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
@@ -32,6 +31,7 @@ import com._1c.g5.v8.dt.metadata.mdclass.EventSubscription;
 import com._1c.g5.v8.dt.metadata.mdclass.ExchangePlan;
 import com._1c.g5.v8.dt.metadata.mdclass.InformationRegister;
 import com._1c.g5.v8.dt.metadata.mdclass.MdObject;
+import com._1c.g5.v8.dt.metadata.mdclass.ObjectBelonging;
 import com._1c.g5.v8.dt.metadata.mdclass.Report;
 import com._1c.g5.v8.dt.metadata.mdclass.ScheduledJob;
 import com._1c.g5.v8.dt.metadata.mdclass.Task;
@@ -39,7 +39,13 @@ import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.preferences.ToolParameterSettings;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.ExtensionOriginUtils;
+import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
+import com.ditrix.edt.mcp.server.utils.MetadataLanguageUtils;
+import com.ditrix.edt.mcp.server.utils.Pagination;
+import com.ditrix.edt.mcp.server.utils.ProjectContext;
 
 /**
  * Tool to get list of metadata objects from 1C configuration.
@@ -76,9 +82,11 @@ public class GetMetadataObjectsTool implements IMcpTool
     @Override
     public String getDescription()
     {
-        return "Get list of metadata objects from 1C configuration. " + //$NON-NLS-1$
-               "Returns Name, Synonym, Comment, Type, ObjectModule, ManagerModule for each object. " + //$NON-NLS-1$
-               "Supports filtering by metadata type."; //$NON-NLS-1$
+        return "Get a flat list of 1C configuration metadata objects (Name, Synonym, Comment, Type, " + //$NON-NLS-1$
+               "ObjectModule, ManagerModule) as a Markdown table. " + //$NON-NLS-1$
+               "Use it to discover what objects exist; filter by metadataType and/or nameFilter (Name only). " + //$NON-NLS-1$
+               "Use this to list objects; for the full properties of one named object use get_metadata_details. " + //$NON-NLS-1$
+               "Full parameters and examples: call get_tool_guide('get_metadata_objects')."; //$NON-NLS-1$
     }
     
     @Override
@@ -88,16 +96,16 @@ public class GetMetadataObjectsTool implements IMcpTool
             .stringProperty("projectName", //$NON-NLS-1$
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringProperty("metadataType", //$NON-NLS-1$
-                "Filter by metadata type: 'all', 'documents', 'catalogs', 'informationRegisters', " + //$NON-NLS-1$
-                "'accumulationRegisters', 'commonModules', 'enums', 'constants', 'reports', 'dataProcessors', " + //$NON-NLS-1$
-                "'exchangePlans', 'businessProcesses', 'tasks', 'commonAttributes', 'eventSubscriptions', " + //$NON-NLS-1$
-                "'scheduledJobs'. Default: 'all'") //$NON-NLS-1$
+                "Type filter (case-insensitive), default 'all'. One of: all, documents, catalogs, " + //$NON-NLS-1$
+                "informationRegisters, accumulationRegisters, commonModules, enums, constants, reports, " + //$NON-NLS-1$
+                "dataProcessors, exchangePlans, businessProcesses, tasks, commonAttributes, " + //$NON-NLS-1$
+                "eventSubscriptions, scheduledJobs") //$NON-NLS-1$
             .stringProperty("nameFilter", //$NON-NLS-1$
-                "Partial name match filter (case-insensitive)") //$NON-NLS-1$
+                "Case-insensitive substring matched against Name only (not Synonym)") //$NON-NLS-1$
             .integerProperty("limit", //$NON-NLS-1$
-                "Maximum number of results. Default: 100") //$NON-NLS-1$
+                "Max rows (default from preferences: 100, max 1000)") //$NON-NLS-1$
             .stringProperty("language", //$NON-NLS-1$
-                "Language code for synonyms (e.g. 'en', 'ru'). If not specified, uses configuration default language.") //$NON-NLS-1$
+                "Synonym language code, e.g. 'en'/'ru' (default: configuration default)") //$NON-NLS-1$
             .build();
     }
     
@@ -127,9 +135,10 @@ public class GetMetadataObjectsTool implements IMcpTool
         String language = JsonUtils.extractStringArgument(params, "language"); //$NON-NLS-1$
 
         // Validate required parameter
-        if (projectName == null || projectName.isEmpty())
+        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        if (err != null)
         {
-            return "Error: projectName is required"; //$NON-NLS-1$
+            return err;
         }
 
         // Set defaults
@@ -142,8 +151,8 @@ public class GetMetadataObjectsTool implements IMcpTool
         int defaultLimit = ToolParameterSettings.getInstance()
             .getParameterValue(NAME, "limit", 100); //$NON-NLS-1$
         int limit = JsonUtils.extractIntArgument(params, "limit", defaultLimit); //$NON-NLS-1$
-        limit = Math.min(Math.max(1, limit), 1000);
-        
+        limit = Pagination.clampLimit(limit, 1000);
+
         // Execute on UI thread
         AtomicReference<String> resultRef = new AtomicReference<>();
         final String mdType = metadataType;
@@ -161,7 +170,7 @@ public class GetMetadataObjectsTool implements IMcpTool
             catch (Exception e)
             {
                 Activator.logError("Error getting metadata objects", e); //$NON-NLS-1$
-                resultRef.set("Error: " + e.getMessage()); //$NON-NLS-1$
+                resultRef.set(ToolResult.error(e.getMessage()).toJson());
             }
         });
         
@@ -175,39 +184,30 @@ public class GetMetadataObjectsTool implements IMcpTool
                                                String nameFilter, int limit, String language)
     {
         // Get project
-        IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
-        if (project == null || !project.exists())
+        ProjectContext ctx = ProjectContext.of(projectName);
+        if (!ctx.exists())
         {
-            return "Error: Project not found: " + projectName; //$NON-NLS-1$
+            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
         }
+        IProject project = ctx.project();
         
         // Get configuration
         IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
         if (configProvider == null)
         {
-            return "Error: Configuration provider not available"; //$NON-NLS-1$
+            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
         }
         
         Configuration config = configProvider.getConfiguration(project);
         if (config == null)
         {
-            return "Error: Could not get configuration for project: " + projectName; //$NON-NLS-1$
+            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
         }
         
-        // Determine language for synonyms
-        String effectiveLanguage = language;
-        if (effectiveLanguage == null || effectiveLanguage.isEmpty())
-        {
-            // Use configuration default language
-            if (config.getDefaultLanguage() != null)
-            {
-                effectiveLanguage = config.getDefaultLanguage().getName();
-            }
-            else
-            {
-                effectiveLanguage = "ru"; // Fallback to Russian //$NON-NLS-1$
-            }
-        }
+        // Determine language CODE for synonyms (the synonym map is keyed by code,
+        // e.g. "ru"/"en", not by the Language object's name). May be null when the
+        // configuration has no languages; getSynonymForLanguage tolerates that.
+        String effectiveLanguage = MetadataLanguageUtils.resolveLanguageCode(config, language);
         
         // Collect metadata objects
         List<MetadataInfo> objects = new ArrayList<>();
@@ -277,21 +277,27 @@ public class GetMetadataObjectsTool implements IMcpTool
                 collectScheduledJobs(config, objects, nameFilter);
                 break;
             default:
-                return "Error: Unknown metadata type: " + metadataType + ". " + //$NON-NLS-1$ //$NON-NLS-2$
+                return ToolResult.error("Unknown metadata type: " + metadataType + ". " + //$NON-NLS-1$ //$NON-NLS-2$
                        "Supported (case-insensitive): all, documents, catalogs, informationRegisters, accumulationRegisters, " + //$NON-NLS-1$
                        "commonModules, enums, constants, reports, dataProcessors, exchangePlans, " + //$NON-NLS-1$
-                       "businessProcesses, tasks, commonAttributes, eventSubscriptions, scheduledJobs"; //$NON-NLS-1$
+                       "businessProcesses, tasks, commonAttributes, eventSubscriptions, scheduledJobs").toJson(); //$NON-NLS-1$
         }
         
+        // An object's ORIGIN (core vs extension-adopted vs extension-own) is only
+        // meaningful for an EXTENSION project, where adopted base objects are listed
+        // alongside the extension's own. Resolve the project type once and surface an
+        // Origin column only then; a base configuration keeps its original columns.
+        boolean isExtensionProject = ExtensionOriginUtils.isExtensionProject(project);
+
         // Format output
-        return formatOutput(projectName, objects, limit, effectiveLanguage, metadataType);
+        return formatOutput(projectName, objects, limit, effectiveLanguage, metadataType, isExtensionProject);
     }
-    
+
     /**
      * Formats the output as markdown.
      */
     private String formatOutput(String projectName, List<MetadataInfo> objects, int limit,
-                                 String language, String metadataType)
+                                 String language, String metadataType, boolean isExtensionProject)
     {
         StringBuilder sb = new StringBuilder();
         
@@ -305,10 +311,7 @@ public class GetMetadataObjectsTool implements IMcpTool
             sb.append("**Filter:** ").append(metadataType).append("\n"); //$NON-NLS-1$ //$NON-NLS-2$
         }
         sb.append("**Total:** ").append(total).append(" objects"); //$NON-NLS-1$ //$NON-NLS-2$
-        if (shown < total)
-        {
-            sb.append(" (showing ").append(shown).append(")"); //$NON-NLS-1$ //$NON-NLS-2$
-        }
+        sb.append(Pagination.truncationNotice(shown, total));
         sb.append("\n\n"); //$NON-NLS-1$
         
         if (objects.isEmpty())
@@ -317,10 +320,20 @@ public class GetMetadataObjectsTool implements IMcpTool
             return sb.toString();
         }
         
-        // Table header
-        sb.append("| Name | Synonym | Comment | Type | ObjectModule | ManagerModule |\n"); //$NON-NLS-1$
-        sb.append("|------|---------|---------|------|--------------|---------------|\n"); //$NON-NLS-1$
-        
+        // Table header. Cells are escaped by MarkdownUtils.tableRow, so a
+        // synonym or comment containing '|' cannot break the table. The Origin
+        // column is appended only for an extension project (see isExtensionProject).
+        if (isExtensionProject)
+        {
+            sb.append(MarkdownUtils.tableHeader(
+                "Name", "Synonym", "Comment", "Type", "ObjectModule", "ManagerModule", "Origin")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$ //$NON-NLS-7$
+        }
+        else
+        {
+            sb.append(MarkdownUtils.tableHeader(
+                "Name", "Synonym", "Comment", "Type", "ObjectModule", "ManagerModule")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
+        }
+
         // Table rows
         int count = 0;
         for (MetadataInfo info : objects)
@@ -329,22 +342,38 @@ public class GetMetadataObjectsTool implements IMcpTool
             {
                 break;
             }
-            
+
             // Get synonym for the specified language
             String displaySynonym = getSynonymForLanguage(info, language);
             String displayComment = info.comment != null ? info.comment : ""; //$NON-NLS-1$
-            
-            sb.append("| ").append(info.name); //$NON-NLS-1$
-            sb.append(" | ").append(displaySynonym); //$NON-NLS-1$
-            sb.append(" | ").append(displayComment); //$NON-NLS-1$
-            sb.append(" | ").append(info.type); //$NON-NLS-1$
-            sb.append(" | ").append(info.hasObjectModule ? "Yes" : "-"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            sb.append(" | ").append(info.hasManagerModule ? "Yes" : "-"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            sb.append(" |\n"); //$NON-NLS-1$
-            
+            String objectModule = info.hasObjectModule ? "Yes" : "-"; //$NON-NLS-1$ //$NON-NLS-2$
+            String managerModule = info.hasManagerModule ? "Yes" : "-"; //$NON-NLS-1$ //$NON-NLS-2$
+
+            if (isExtensionProject)
+            {
+                sb.append(MarkdownUtils.tableRow(
+                    info.name,
+                    displaySynonym,
+                    displayComment,
+                    info.type,
+                    objectModule,
+                    managerModule,
+                    ExtensionOriginUtils.originLabel(info.belonging, true)));
+            }
+            else
+            {
+                sb.append(MarkdownUtils.tableRow(
+                    info.name,
+                    displaySynonym,
+                    displayComment,
+                    info.type,
+                    objectModule,
+                    managerModule));
+            }
+
             count++;
         }
-        
+
         return sb.toString();
     }
     
@@ -568,6 +597,9 @@ public class GetMetadataObjectsTool implements IMcpTool
         info.name = mdObject.getName();
         info.type = type;
         info.comment = mdObject.getComment();
+        // ORIGIN discriminator: NATIVE vs ADOPTED. Only meaningful when the owning
+        // project is an extension; resolved into a label at format time.
+        info.belonging = mdObject.getObjectBelonging();
         
         // Get synonyms - getSynonym() returns EMap<String, String> directly
         EMap<String, String> synonym = mdObject.getSynonym();
@@ -605,23 +637,8 @@ public class GetMetadataObjectsTool implements IMcpTool
      */
     private String getSynonymForLanguage(MetadataInfo info, String language)
     {
-        // Try the requested language first
-        String synonym = info.synonyms.get(language);
-        if (synonym != null && !synonym.isEmpty())
-        {
-            return synonym;
-        }
-        
-        // Fallback: try to find any available synonym
-        for (String val : info.synonyms.values())
-        {
-            if (val != null && !val.isEmpty())
-            {
-                return val;
-            }
-        }
-        
-        return ""; //$NON-NLS-1$
+        // info.synonyms is keyed by language CODE; delegate to the shared resolver.
+        return MetadataLanguageUtils.getSynonymForLanguage(info.synonyms, language);
     }
     
     /**
@@ -635,5 +652,6 @@ public class GetMetadataObjectsTool implements IMcpTool
         String type;
         boolean hasObjectModule;
         boolean hasManagerModule;
+        ObjectBelonging belonging;
     }
 }

@@ -56,6 +56,18 @@ public class ResumeTool implements IMcpTool
     }
 
     @Override
+    public String getOutputSchema()
+    {
+        return JsonSchemaBuilder.object()
+            .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("resumed", "Whether the thread or target was resumed") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("scope", "Resume scope: 'thread' or 'target'") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("applicationId", "Application id of the resumed debug target") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty("autoResolved", "Whether the lone active launch was auto-resolved") //$NON-NLS-1$ //$NON-NLS-2$
+            .build();
+    }
+
+    @Override
     public ResponseType getResponseType()
     {
         return ResponseType.JSON;
@@ -103,11 +115,31 @@ public class ResumeTool implements IMcpTool
             {
                 return ToolResult.error("no active debug target for applicationId: " + effectiveAppId).toJson(); //$NON-NLS-1$
             }
-            if (!target.canResume())
+            if (target.canResume())
             {
-                return ToolResult.error("debug target cannot resume").toJson(); //$NON-NLS-1$
+                target.resume();
             }
-            target.resume();
+            else
+            {
+                // 1C debug targets resume at the THREAD granularity: the target itself
+                // can report canResume()==false while one of its threads is suspended at
+                // a breakpoint. Fall back to resuming each suspended thread so the
+                // documented no-argument / applicationId convenience actually releases a
+                // 1C session instead of dead-ending at "debug target cannot resume".
+                int resumed = 0;
+                for (IThread t : target.getThreads())
+                {
+                    if (t.canResume())
+                    {
+                        t.resume();
+                        resumed++;
+                    }
+                }
+                if (resumed == 0)
+                {
+                    return ToolResult.error("debug target cannot resume (no suspended thread to resume)").toJson(); //$NON-NLS-1$
+                }
+            }
             ToolResult res = ToolResult.success()
                 .put("resumed", true) //$NON-NLS-1$
                 .put("scope", "target") //$NON-NLS-1$ //$NON-NLS-2$
@@ -121,7 +153,7 @@ public class ResumeTool implements IMcpTool
         catch (Exception e)
         {
             Activator.logError("Error in resume", e); //$NON-NLS-1$
-            return ToolResult.error("Error: " + e.getMessage()).toJson(); //$NON-NLS-1$
+            return ToolResult.error(e.getMessage()).toJson(); //$NON-NLS-1$
         }
     }
 

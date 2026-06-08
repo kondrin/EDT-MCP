@@ -39,6 +39,16 @@ public class PreferenceInitializer extends AbstractPreferenceInitializer
         store.setDefault(PreferenceConstants.PREF_DISABLED_TOOLS,
             PreferenceConstants.DEFAULT_DISABLED_TOOLS);
 
+        // Progressive tool disclosure (dynamic toolsets)
+        store.setDefault(PreferenceConstants.PREF_PROGRESSIVE_DISCLOSURE,
+            PreferenceConstants.DEFAULT_PROGRESSIVE_DISCLOSURE);
+
+        // Security
+        store.setDefault(PreferenceConstants.PREF_ALLOW_REMOTE_ACCESS,
+            PreferenceConstants.DEFAULT_ALLOW_REMOTE_ACCESS);
+        store.setDefault(PreferenceConstants.PREF_AUTH_TOKEN,
+            PreferenceConstants.DEFAULT_AUTH_TOKEN);
+
         // Per-tool parameter defaults
         ToolParameterSettings.getInstance().initializeDefaults(store);
     }
