@@ -16,7 +16,30 @@
 
   <name>EDT MCP Server Plugin</name>
 
+  <properties>
+    <!-- Tycho eclipse-plugin layout: sources live in src/ and Tycho compiles to
+         target/classes. The Sonar Maven scanner does NOT infer these for eclipse-plugin
+         packaging (without them Sonar indexes ~0 Java files and imports no coverage). -->
+    <sonar.sources>src</sonar.sources>
+    <sonar.java.binaries>target/classes</sonar.java.binaries>
+    <!-- Sonar reads coverage for this bundle from the report generated below -->
+    <sonar.coverage.jacoco.xmlReportPaths>target/site/jacoco/jacoco.xml</sonar.coverage.jacoco.xmlReportPaths>
+  </properties>
+
   <build>
+    <plugins>
+      <!-- `mvn -pl bundles/com.ditrix.edt.mcp.server jacoco:report` (after verify) turns the
+           tests fragment's .exec into an XML report against THIS bundle's classes/sources.
+           No execution binding: the bundle builds before the tests, so the report is a
+           separate CLI step once the .exec exists. -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <configuration>
+          <dataFile>${project.basedir}/../../tests/com.ditrix.edt.mcp.server.tests/target/jacoco.exec</dataFile>
+        </configuration>
+      </plugin>
+    </plugins>
     <pluginManagement>
       <plugins>
         <plugin>
