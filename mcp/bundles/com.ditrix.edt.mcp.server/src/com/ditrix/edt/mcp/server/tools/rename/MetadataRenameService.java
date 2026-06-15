@@ -126,7 +126,7 @@ public class MetadataRenameService
         Collection<IRefactoring> refactorings, int maxResults)
     {
         Map<String, ExactMatchInfo> exactMatches = buildExactMatchInfo(project, targetObject, newName);
-        List<ChangePoint> edtBslPreviewChanges = buildEdtBslPreviewChanges(project, targetObject, newName, exactMatches);
+        List<ChangePoint> edtBslPreviewChanges = buildEdtBslPreviewChanges(targetObject, newName, exactMatches);
         String oldName = targetObject.getName();
 
         // Phase 1: collect all changes and problems
@@ -638,8 +638,7 @@ public class MetadataRenameService
             Collection<?> matches = (Collection<?>) invokeMethod(supplier, "getMatches", //$NON-NLS-1$
                 new Class<?>[] {Change.class, getClassOrThrow("com._1c.g5.v8.dt.search.core.SimpleSearchResultCollector")}, //$NON-NLS-1$
                 normalChange, collector);
-            Map<String, ExactMatchInfo> exactMatchMap = toExactMatchMap(matches);
-            return exactMatchMap;
+            return toExactMatchMap(matches);
         }
         catch (Exception e)
         {
@@ -648,7 +647,7 @@ public class MetadataRenameService
         }
     }
 
-    private List<ChangePoint> buildEdtBslPreviewChanges(IProject project, MdObject targetObject, String newName,
+    private List<ChangePoint> buildEdtBslPreviewChanges(MdObject targetObject, String newName,
         Map<String, ExactMatchInfo> exactMatches)
     {
         try
