@@ -79,6 +79,17 @@ public final class FormElementWriter
     private static final String FEATURE_EXT_INFO = "extInfo"; //$NON-NLS-1$
     private static final String FEATURE_ID = "id"; //$NON-NLS-1$
     private static final String FEATURE_NAME = "name"; //$NON-NLS-1$
+    /** The form attribute's "is the form's main data source" flag. */
+    private static final String FEATURE_MAIN = "main"; //$NON-NLS-1$
+    /** The dynamic-list ext-info EClass and its query-carrying features. */
+    private static final String ECLASS_DYNAMIC_LIST_EXT_INFO = "DynamicListExtInfo"; //$NON-NLS-1$
+    private static final String FEATURE_QUERY_TEXT = "queryText"; //$NON-NLS-1$
+    private static final String FEATURE_CUSTOM_QUERY = "customQuery"; //$NON-NLS-1$
+    private static final String FEATURE_AUTO_FILL_AVAILABLE_FIELDS = "autoFillAvailableFields"; //$NON-NLS-1$
+    /** "Dynamic data reading" - the designer enables it for a new dynamic list. */
+    private static final String FEATURE_DYNAMIC_DATA_READ = "dynamicDataRead"; //$NON-NLS-1$
+    /** The dynamic list's main table - a DbViewDef reference (resolved from an object FQN). */
+    private static final String FEATURE_MAIN_TABLE = "mainTable"; //$NON-NLS-1$
     private static final String FEATURE_VISIBLE = "visible"; //$NON-NLS-1$
     private static final String FEATURE_ENABLED = "enabled"; //$NON-NLS-1$
     private static final String FEATURE_USER_VISIBLE = "userVisible"; //$NON-NLS-1$
@@ -1167,6 +1178,169 @@ public final class FormElementWriter
         return null;
     }
 
+    /**
+     * Configures the form {@code attribute} as a <b>dynamic list with a custom query</b>, fully
+     * reflectively (no compile dependency on the form model). If the attribute is not already a dynamic
+     * list it is turned into one: a {@code DynamicListExtInfo} is created, the {@code DynamicList} value
+     * type is set, {@code autoFillAvailableFields} is turned on (so the platform derives the available
+     * fields from the query - no DCS {@code <fields>} block is authored), and the attribute is marked as
+     * the form's main attribute when the form has none yet. Then {@code queryText} and/or
+     * {@code customQuery} are applied to the ext-info. A non-null {@code queryText} implies
+     * {@code customQuery=true} unless {@code customQuery} is given explicitly. Runs inside the BM write
+     * transaction opened by the caller (the {@code attribute} is the tx-bound member).
+     *
+     * @param formModel the tx-bound content form
+     * @param attribute the form attribute to configure (must be a {@code FormAttribute})
+     * @param queryText the custom query text, or {@code null} to leave it unchanged
+     * @param customQuery the explicit custom-query flag, or {@code null} to default it from
+     *            {@code queryText}
+     * @param mainTableFqn the FQN of the object whose main table the list reads from (its
+     *            {@code DbViewDef} is set as the list's {@code mainTable}), or {@code null} to leave it
+     *            unchanged
+     * @param config the configuration, to resolve {@code mainTableFqn}
+     * @param version the platform version (to build the {@code DynamicList} value type)
+     * @return the feature names actually set (for the success payload), in apply order
+     */
+    public static List<String> configureDynamicListQuery(EObject formModel, EObject attribute,
+        String queryText, Boolean customQuery, String mainTableFqn, Configuration config, Version version)
+    {
+        List<String> applied = new ArrayList<>();
+
+        EObject extInfo = singleReference(attribute, FEATURE_EXT_INFO);
+        boolean alreadyDynamicList = isDynamicListAttribute(attribute);
+        if (!alreadyDynamicList && queryText == null && mainTableFqn == null)
+        {
+            // Converting a plain attribute to a dynamic list needs a query or a main table, so a bare
+            // 'customQuery' toggle on a not-yet-dynamic-list attribute would create an incomplete list.
+            // Require the query text (or main table) up front. (Toggling 'customQuery' on an EXISTING
+            // dynamic list keeps its stored query, so it is allowed.)
+            throw new FormValidationException(ToolResult.error(
+                "To create a dynamic list, provide a 'queryText' (the custom query), e.g. " //$NON-NLS-1$
+                + "{name:'queryText', value:'SELECT Ref, Description AS Description FROM " //$NON-NLS-1$
+                + "Catalog.Products'}. 'customQuery' alone only toggles an attribute that is already a " //$NON-NLS-1$
+                + "dynamic list.").toJson()); //$NON-NLS-1$
+        }
+        if (!alreadyDynamicList)
+        {
+            // Turn a plain form attribute into a dynamic list: create the ext-info, set the DynamicList
+            // value type, auto-fill available fields, and make it the form's main attribute if none yet.
+            setExtInfoClassifier(formModel, attribute, ECLASS_DYNAMIC_LIST_EXT_INFO);
+            extInfo = singleReference(attribute, FEATURE_EXT_INFO);
+            if (extInfo == null)
+            {
+                throw new IllegalStateException(
+                    "The form model does not expose a DynamicListExtInfo classifier."); //$NON-NLS-1$
+            }
+            EObject dynamicListType = MetadataTypeBuilder.dynamicListType(version);
+            EStructuralFeature valueTypeFeature =
+                attribute.eClass().getEStructuralFeature(FEATURE_VALUE_TYPE);
+            if (dynamicListType != null && valueTypeFeature instanceof EReference)
+            {
+                attribute.eSet(valueTypeFeature, dynamicListType);
+            }
+            setBooleanFeature(extInfo, FEATURE_AUTO_FILL_AVAILABLE_FIELDS, true);
+            // The designer turns on "dynamic data reading" for a new dynamic list (the model default is
+            // false); mirror it so an MCP-created list matches a designer-created one.
+            setBooleanFeature(extInfo, FEATURE_DYNAMIC_DATA_READ, true);
+            if (!hasMainAttribute(formModel))
+            {
+                setBooleanFeature(attribute, FEATURE_MAIN, true);
+            }
+            applied.add("dynamicList"); //$NON-NLS-1$
+        }
+
+        boolean effectiveCustomQuery = customQuery != null ? customQuery.booleanValue() : queryText != null;
+        if (queryText != null)
+        {
+            setStringFeature(extInfo, FEATURE_QUERY_TEXT, queryText);
+            applied.add(FEATURE_QUERY_TEXT);
+        }
+        if (customQuery != null || queryText != null)
+        {
+            setBooleanFeature(extInfo, FEATURE_CUSTOM_QUERY, effectiveCustomQuery);
+            applied.add(FEATURE_CUSTOM_QUERY);
+            if (effectiveCustomQuery)
+            {
+                // A custom query without auto-filled fields trips the platform field-binding checks; keep
+                // auto-fill on whenever the query is custom so EDT derives the available fields.
+                setBooleanFeature(extInfo, FEATURE_AUTO_FILL_AVAILABLE_FIELDS, true);
+            }
+        }
+        if (mainTableFqn != null)
+        {
+            EObject mainTable = resolveMainTableDbView(config, mainTableFqn);
+            if (mainTable == null)
+            {
+                throw new FormValidationException(ToolResult.error(
+                    "Cannot resolve the main table '" + mainTableFqn + "'. Pass the FQN of the object " //$NON-NLS-1$ //$NON-NLS-2$
+                    + "the list reads from, e.g. 'Catalog.Products' or 'Document.Order'.").toJson()); //$NON-NLS-1$
+            }
+            EStructuralFeature mainTableFeature = extInfo.eClass().getEStructuralFeature(FEATURE_MAIN_TABLE);
+            if (mainTableFeature instanceof EReference)
+            {
+                extInfo.eSet(mainTableFeature, mainTable);
+                applied.add(FEATURE_MAIN_TABLE);
+            }
+        }
+        return applied;
+    }
+
+    /** Whether a form attribute carries a {@code DynamicListExtInfo} (i.e. it is a dynamic list). */
+    private static boolean isDynamicListAttribute(EObject attribute)
+    {
+        EObject extInfo = singleReference(attribute, FEATURE_EXT_INFO);
+        return extInfo != null && ECLASS_DYNAMIC_LIST_EXT_INFO.equals(extInfo.eClass().getName());
+    }
+
+    /**
+     * Resolves an object FQN (e.g. {@code "Document.Order"}) to the {@code DbViewDef} of its MAIN table -
+     * the value a dynamic list's {@code mainTable} reference holds. Reflective (no compile dependency on
+     * the dbview model): {@code MdObject.dbViewDefs} -> the typed {@code *DbViewDefs} container ->
+     * {@code mainView}. Returns {@code null} when the object, its db-view container, or the main view
+     * cannot be resolved (e.g. derived data not yet computed). Must run inside the BM transaction so the
+     * resolved DbViewDef is the project's canonical one.
+     */
+    private static EObject resolveMainTableDbView(Configuration config, String fqn)
+    {
+        if (config == null)
+        {
+            return null;
+        }
+        MetadataNodeResolver.MetadataNode node = MetadataNodeResolver.resolveExisting(config, fqn);
+        if (node == null || node.object == null)
+        {
+            return null;
+        }
+        EObject md = node.object;
+        EStructuralFeature dbViewDefsFeature = md.eClass().getEStructuralFeature("dbViewDefs"); //$NON-NLS-1$
+        if (dbViewDefsFeature == null || !(md.eGet(dbViewDefsFeature) instanceof EObject))
+        {
+            return null;
+        }
+        EObject dbViewDefs = (EObject)md.eGet(dbViewDefsFeature);
+        EStructuralFeature mainViewFeature = dbViewDefs.eClass().getEStructuralFeature("mainView"); //$NON-NLS-1$
+        if (mainViewFeature == null)
+        {
+            return null;
+        }
+        Object mainView = dbViewDefs.eGet(mainViewFeature);
+        return mainView instanceof EObject ? (EObject)mainView : null;
+    }
+
+    /** Whether the form already has an attribute flagged as its main data source. */
+    private static boolean hasMainAttribute(EObject formModel)
+    {
+        for (EObject attr : referenceList(formModel, FEATURE_ATTRIBUTES))
+        {
+            EStructuralFeature mainFeature = attr.eClass().getEStructuralFeature(FEATURE_MAIN);
+            if (mainFeature != null && Boolean.TRUE.equals(attr.eGet(mainFeature)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static String createCommand(EObject formModel, String name, String titleLanguage,
         String title, String[] createdKind)
     {
@@ -1619,7 +1793,6 @@ public final class FormElementWriter
     }
 
     /** A FormField bound to a form attribute via its dataPath (a generic InputField the user can refine). */
-    @SuppressWarnings("unchecked")
     private static String createField(EObject formModel, String name, String parentName, // NOSONAR signature is inherent / public-or-test-contract; a parameter-object would not improve clarity
         String attrName, String titleLanguage, String title, boolean russianAutoNames,
         String[] createdKind)
@@ -1629,10 +1802,23 @@ public final class FormElementWriter
             return "A form field needs a 'dataPath' property naming the form attribute it shows " //$NON-NLS-1$
                 + "(e.g. {name:'dataPath', value:'Price'})."; //$NON-NLS-1$
         }
-        if (findByName(referenceList(formModel, FEATURE_ATTRIBUTES), attrName) == null)
+        // The field binds to a form attribute by name. A DOTTED path (e.g. "List.Number") binds to a
+        // dynamic-list COLUMN: the head segment is the dynamic-list attribute, the tail is one of its
+        // query fields (auto-filled by EDT - not a model attribute). Validate the head attribute, and
+        // require it to be a dynamic list when a dotted path is used.
+        int dot = attrName.indexOf('.');
+        String headAttr = dot > 0 ? attrName.substring(0, dot) : attrName;
+        EObject boundAttribute = findByName(referenceList(formModel, FEATURE_ATTRIBUTES), headAttr);
+        if (boundAttribute == null)
         {
-            return "Form attribute '" + attrName + "' not found - create it first, then bind the field " //$NON-NLS-1$ //$NON-NLS-2$
+            return "Form attribute '" + headAttr + "' not found - create it first, then bind the field " //$NON-NLS-1$ //$NON-NLS-2$
                 + "to it (so the data path resolves)."; //$NON-NLS-1$
+        }
+        if (dot > 0 && !isDynamicListAttribute(boundAttribute))
+        {
+            return "'" + attrName + "' is a nested data path, but '" + headAttr + "' is not a dynamic " //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                + "list. A field binds to a form attribute by name (e.g. 'Price'); a dotted path is only " //$NON-NLS-1$
+                + "for a dynamic-list column (e.g. 'List.Number', where the list has a custom query)."; //$NON-NLS-1$
         }
         if (findItem(formModel, name) != null)
         {
@@ -1651,19 +1837,12 @@ public final class FormElementWriter
         setStringFeature(item, FEATURE_NAME, name);
         applyVisibleDefaults(item);
         setIntFeature(item, FEATURE_ID, nextItemId(formModel));
-        // dataPath: a contained DataPath with segments=[attrName] (objects is transient - left empty,
-        // the form's derived data recomputes it).
-        EStructuralFeature dpFeat = item.eClass().getEStructuralFeature("dataPath"); //$NON-NLS-1$
-        EObject dataPath = createFromClassifier(formModel, "DataPath"); //$NON-NLS-1$
-        if (dpFeat instanceof EReference && dataPath != null)
-        {
-            EStructuralFeature segFeat = dataPath.eClass().getEStructuralFeature("segments"); //$NON-NLS-1$
-            if (segFeat != null && dataPath.eGet(segFeat) instanceof EList<?>)
-            {
-                ((EList<String>)dataPath.eGet(segFeat)).add(attrName);
-            }
-            item.eSet(dpFeat, dataPath);
-        }
+        // dataPath: a contained DataPath whose segments are the DOT-SPLIT parts of attrName, so the
+        // validator resolves it segment by segment - a plain attribute ("Price" -> ["Price"]) and a
+        // dynamic-list column ("List.Number" -> ["List", "Number"]) alike. A single dotted segment
+        // would be read as one object name and flagged form-data-path. (objects is transient - the
+        // form's derived data recomputes it.)
+        buildDataPath(formModel, item, attrName);
         // Pure-model default field type (InputField + a fresh InputFieldExtInfo), as the platform's
         // own factory does before the value type is known.
         setEnumFeature(item, FEATURE_TYPE, "InputField"); //$NON-NLS-1$
